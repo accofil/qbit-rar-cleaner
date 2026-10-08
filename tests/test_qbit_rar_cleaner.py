@@ -467,6 +467,40 @@ class SafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(cleaner.CleanerError, "ISO-mód"):
             cleaner.run_rar_mode(None, {}, object(), Path("/"), Path("/"), ())
 
+    def test_prefers_unrar_over_legacy_seven_zip_configuration(self):
+        extractor = cleaner.configured_extractor(
+            {"unrar": "/usr/bin/unrar", "seven_zip": "/usr/bin/7z"}
+        )
+
+        self.assertIsInstance(extractor, cleaner.Unrar)
+
+    def test_unrar_technical_listing_is_parsed_and_links_are_rejected(self):
+        listing = """
+        Name: movie.mkv
+        Type: File
+        Size: 44929228245
+
+        Name: BDMV
+        Type: Directory
+        Size: 0
+        """
+        extractor = cleaner.Unrar("unrar")
+        with mock.patch.object(extractor, "_run") as run:
+            run.return_value = mock.Mock(stdout=listing)
+            self.assertEqual(
+                extractor.entries(Path("release.rar")),
+                (
+                    cleaner.ArchiveEntry(Path("movie.mkv"), False, 44929228245),
+                    cleaner.ArchiveEntry(Path("BDMV"), True, 0),
+                ),
+            )
+
+            run.return_value = mock.Mock(
+                stdout="Name: escape\nType: Unix symbolic link\nSize: 0\nTarget: ../x\n"
+            )
+            with self.assertRaisesRegex(cleaner.ArchiveError, "linket"):
+                extractor.entries(Path("release.rar"))
+
     def test_rejects_archive_traversal_and_windows_absolute_paths(self):
         unsafe = ["../escape.mkv", "/etc/passwd", "C:\\Windows\\file"]
         for item in unsafe:

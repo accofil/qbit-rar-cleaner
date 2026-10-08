@@ -836,6 +836,82 @@ class SevenZip:
         )
 
 
+class Unrar:
+    """RAR reader backed by the upstream unrar command line tool."""
+
+    def __init__(self, executable: str):
+        self.executable = executable
+
+    def _run(self, arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+        completed = subprocess.run(
+            [self.executable, *arguments],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+            check=False,
+        )
+        if completed.returncode != 0:
+            tail = "\n".join(completed.stdout.splitlines()[-20:])
+            raise ArchiveError(
+                f"UnRAR hiba (exit={completed.returncode}):\n{tail}"
+            )
+        return completed
+
+    def test(self, first_volume: Path) -> None:
+        self._run(["t", "-y", "-c-", "-p-", str(first_volume)])
+
+    def entries(self, first_volume: Path) -> tuple[ArchiveEntry, ...]:
+        output = self._run(["lt", "-c-", "-p-", str(first_volume)]).stdout
+        records: list[dict[str, str]] = []
+        current: dict[str, str] = {}
+        for line in output.splitlines():
+            match = re.match(r"^\s*([^:]+):\s?(.*)$", line)
+            if not match:
+                continue
+            key, value = match.group(1).strip(), match.group(2)
+            if key == "Name" and current:
+                records.append(current)
+                current = {}
+            if key in {"Name", "Type", "Size", "Target"}:
+                current[key] = value
+        if current:
+            records.append(current)
+
+        entries: list[ArchiveEntry] = []
+        for record in records:
+            if "Name" not in record or "Type" not in record:
+                continue
+            entry_type = record["Type"].casefold()
+            if "link" in entry_type or "Target" in record:
+                raise ArchiveError("Az archívum linket tartalmaz")
+            relative = _safe_archive_member(record["Name"])
+            is_directory = entry_type == "directory"
+            try:
+                size = int(record.get("Size", "0"))
+            except ValueError as exc:
+                raise ArchiveError("Érvénytelen méretadat a RAR-listában") from exc
+            entries.append(ArchiveEntry(relative, is_directory, size))
+        if not entries:
+            raise ArchiveError(f"Az archívum nem tartalmaz listázható elemet: {first_volume}")
+        return tuple(entries)
+
+    def extract(self, first_volume: Path, destination: Path) -> None:
+        destination.mkdir(parents=True, exist_ok=False)
+        self._run(
+            ["x", "-y", "-o+", "-c-", "-p-", str(first_volume), f"{destination}/"]
+        )
+
+
+def configured_extractor(config: dict[str, object]) -> Unrar | SevenZip | None:
+    if config.get("unrar"):
+        return Unrar(str(config["unrar"]))
+    if config.get("seven_zip"):
+        return SevenZip(str(config["seven_zip"]))
+    return None
+
+
 class IsoMounter:
     def __init__(self, mount_command: str, umount_command: str):
         self.mount_command = mount_command
@@ -1216,7 +1292,7 @@ def process_component(
     component: Component,
     torrent_by_hash: dict[str, Torrent],
     client: QbitClient,
-    extractor: SevenZip,
+    extractor: Unrar | SevenZip,
     scan_root: Path,
     work_root: Path,
     min_free_bytes: int,
@@ -1514,7 +1590,7 @@ def load_config(path: Path) -> dict[str, object]:
         config = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise CleanerError(f"A konfiguráció nem olvasható: {path}") from exc
-    # Az ISO-mód szándékosan független a RAR-kibontótól. A seven_zip mezőt
+    # Az ISO-mód szándékosan független a RAR-kibontótól. A kibontó mezőit
     # ezért csak a RAR-mód ellenőrzi, nem a közös konfigurációbetöltés.
     required = ["qb_url", "qb_username", "qb_password", "scan_root"]
     missing = [key for key in required if not config.get(key)]
@@ -1651,10 +1727,10 @@ def run_rar_mode(
     work_root: Path,
     protected_domains: Sequence[str],
 ) -> int:
-    if not config.get("seven_zip"):
+    extractor = configured_extractor(config)
+    if extractor is None:
         raise CleanerError(
-            "Nincs működő RAR-támogatású 7-Zip. Telepítsd a 7zip + 7zip-rar "
-            "vagy a p7zip-full + p7zip-rar csomagpárt, majd futtasd újra a "
+            "Nincs működő RAR-kibontó. Telepítsd az unrar csomagot, majd futtasd újra a "
             "telepítőt. Az ISO-mód ettől függetlenül használható."
         )
 
@@ -1683,7 +1759,6 @@ def run_rar_mode(
             return 2
 
     min_free_bytes = int(config.get("min_free_bytes", 1024 ** 3))
-    extractor = SevenZip(str(config["seven_zip"]))
     failures = 0
     for index, component in enumerate(components, 1):
         print(f"\nRAR-feldolgozás {index}/{len(components)}...")

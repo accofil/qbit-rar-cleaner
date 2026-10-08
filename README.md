@@ -58,7 +58,7 @@ után eltávolítható a listáról.
 3. Lekéri a qBittorrent összes torrentjének pontos fájllistáját.
 4. Teljes elérési út alapján egyezteti a lemezen talált RAR-köteteket.
 5. Csak 100%-os, teljesen és egyértelműen egyező torrentet dolgoz fel.
-6. A 7-Zip tesztparancsával ellenőrzi az archívumot.
+6. Az UnRAR tesztparancsával ellenőrzi az archívumot.
 7. Ideiglenes munkamappába kibontja és ellenőrzi a tartalmat.
 8. A kibontott fájlokat abba a mappába helyezi, ahol a RAR-kötetek vannak.
 9. Leállítja az érintett torrentet vagy cross-seed torrenteket.
@@ -247,16 +247,15 @@ nem működik.
 - qBittorrent natív WebUI/API;
 - qBittorrent WebUI URL, felhasználónév és jelszó;
 - a qBittorrent Linux-felhasználójának teljes hozzáférése a scan roothoz;
-- a RAR-módhoz RAR-támogatású 7-Zip;
+- a RAR-módhoz a natív `unrar` program;
 - util-linux csomag a mount, umount és unshare parancsokhoz;
 - loop eszköz és ISO9660/UDF támogatás a Linux kernelben;
 - internetkapcsolat a telepítéshez szükséges csomagok letöltéséhez.
 
-A telepítő megpróbálja telepíteni a hiányzó Python- és util-linux
-csomagokat. A RAR-támogatást nem egy verziófüggő codec-név alapján, hanem egy
-valódi, apró RAR-próbaarchívum megnyitásával ellenőrzi. Ha ez nem sikerül,
-először a disztribúción elérhető `7zip` + `7zip-rar`, ennek hiányában a
-`p7zip-full` + `p7zip-rar` csomagpárt próbálja telepíteni.
+A telepítő megpróbálja telepíteni a hiányzó Python-, util-linux- és `unrar`
+csomagokat. A RAR-támogatást nem verziószöveg alapján, hanem egy valódi, apró
+RAR-próbaarchívum megnyitásával ellenőrzi. A natív `unrar` használata elkerüli
+az eltérő verziójú 7-Zip motor és külső RAR-plugin okozta összeomlásokat.
 
 Ha a RAR-támogatás ennek ellenére sem érhető el, a telepítő ezt világosan
 jelzi, de nem áll meg az ISO-parancs telepítése előtt. Ilyenkor a
@@ -265,7 +264,7 @@ hibaüzenettel leáll, amíg a RAR-csomagokat nem javítod és a telepítőt új
 nem futtatod.
 
 > [!NOTE]
-> Debian 12 alatt a p7zip-rar csomaghoz szükség lehet a non-free
+> Debian 12 alatt az unrar csomaghoz szükség lehet a non-free
 > csomagtároló engedélyezésére.
 
 ## Telepítés kezdőknek
@@ -508,7 +507,7 @@ A `cp` egy biztonsági másolatot készít a helyi telepítőfájlról. A
 vissza; a storage mappához, a torrentekhez és a telepített konfigurációhoz
 nem nyúl.
 
-Ne frissítsd a telepített programot egy még futó 7-Zip-kibontás vagy
+Ne frissítsd a telepített programot egy még futó UnRAR-kibontás vagy
 ISO-másolás közben.
 
 ## Gyakori hibák
@@ -584,21 +583,14 @@ A telepítő ezt `http://127.0.0.1:10987` címre alakítja, szigorúan ellenőrz
 és hibás zárójel, port, útvonal vagy beágyazott jelszó esetén még a
 konfiguráció mentése előtt leáll.
 
-### Egyik megtalált 7-Zip sem tudja megnyitni a RAR-próbaarchívumot
+### Az UnRAR nem tudja megnyitni a RAR-próbaarchívumot
 
-Debian 12 alatt engedélyezd a non-free csomagtárolót. Először próbáld az új
-csomagpárt:
+Debian 12 alatt engedélyezd a non-free csomagtárolót, majd telepítsd az
+`unrar` csomagot:
 
 ~~~bash
 sudo apt update
-sudo apt install -y 7zip 7zip-rar
-~~~
-
-Ha ezek a csomagnevek nem érhetők el a rendszereden, használd a kompatibilis
-régebbi csomagpárt:
-
-~~~bash
-sudo apt install -y p7zip-full p7zip-rar
+sudo apt install -y unrar
 ~~~
 
 Ezután futtasd újra:

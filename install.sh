@@ -7,7 +7,7 @@ readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly RAR_COMMAND_PATH="/usr/local/bin/qbit-rar-cleaner"
 readonly ISO_COMMAND_PATH="/usr/local/bin/qbit-iso-cleaner"
 # Valódi, egyrészes RAR4 próbaarchívum egyetlen 20 bájtos szövegfájllal.
-# Csak a 7-Zip RAR-olvasási képességének ellenőrzésére szolgál; nem bontjuk ki.
+# Csak az UnRAR olvasási képességének ellenőrzésére szolgál; nem bontjuk ki.
 readonly RAR_PROBE_BASE64="UmFyIRoHAM+QcwAADQAAAAAAAACEUnQgkDIAFAAAABQAAAADQqLIvrd22j4UMAgApIEAAHRlc3QudHh0gAi3dto+t3baPnRlc3QgdGV4dCBkb2N1bWVudA0KxD17AEAHAA=="
 
 rar_probe=""
@@ -108,18 +108,15 @@ if ! printf '%s' "$RAR_PROBE_BASE64" | base64 --decode >"$rar_probe"; then
   exit 1
 fi
 
-find_rar_7z() {
-  local command_name command_path
-  # A 7z pluginokat is tud használni; a Debian-féle 7zz általában nem.
-  for command_name in 7z 7zz; do
-    command_path=$(command -v "$command_name" || true)
-    if [[ -n "$command_path" ]] && \
-       LC_ALL=C LANG=C "$command_path" t -y -bb0 -- "$rar_probe" \
-         >/dev/null 2>&1; then
-      printf '%s' "$command_path"
-      return 0
-    fi
-  done
+find_rar_extractor() {
+  local command_path
+  command_path=$(command -v unrar || true)
+  if [[ -n "$command_path" ]] && \
+     LC_ALL=C LANG=C "$command_path" t -y -c- -p- "$rar_probe" \
+       >/dev/null 2>&1; then
+    printf '%s' "$command_path"
+    return 0
+  fi
   return 1
 }
 
@@ -176,35 +173,27 @@ if ! qb_url=$(normalize_qb_url "$qb_url"); then
   exit 1
 fi
 
-seven_zip=$(find_rar_7z || true)
-if [[ -z "$seven_zip" ]]; then
-  echo "RAR-támogatású 7-Zip telepítése..."
+unrar_command=$(find_rar_extractor || true)
+if [[ -z "$unrar_command" ]]; then
+  echo "UnRAR telepítése..."
   apt-get update
-
-  archive_packages=(p7zip-full p7zip-rar)
-  if apt-cache show 7zip >/dev/null 2>&1 && \
-     apt-cache show 7zip-rar >/dev/null 2>&1; then
-    # Az új Debian-csomagpár plugin-kompatibilis, és a 7z parancsot használja.
-    archive_packages=(7zip 7zip-rar)
-  fi
-
   if ! DEBIAN_FRONTEND=noninteractive apt-get install -y \
-      ca-certificates "${archive_packages[@]}"; then
-    echo "FIGYELEM: a RAR-csomagok telepítése nem sikerült." >&2
+      ca-certificates unrar; then
+    echo "FIGYELEM: az unrar telepítése nem sikerült." >&2
   fi
   hash -r
-  seven_zip=$(find_rar_7z || true)
+  unrar_command=$(find_rar_extractor || true)
 fi
 
 rar_available=true
-if [[ -z "$seven_zip" ]]; then
+if [[ -z "$unrar_command" ]]; then
   rar_available=false
   echo >&2
-  echo "FIGYELEM: egyik megtalált 7-Zip sem tudta megnyitni a valódi RAR-próbaarchívumot." >&2
+  echo "FIGYELEM: az unrar nem tudta megnyitni a valódi RAR-próbaarchívumot." >&2
   echo "A külön ISO-parancs ettől függetlenül települ és használható lesz." >&2
   echo "A RAR-parancs addig biztonságos hibaüzenettel leáll." >&2
-  echo "Debian 12: engedélyezd a non-free komponenst, majd telepítsd a 7zip + 7zip-rar" >&2
-  echo "vagy a p7zip-full + p7zip-rar csomagpárt, és futtasd újra a telepítőt." >&2
+  echo "Debian 12: engedélyezd a non-free komponenst, telepítsd az unrar csomagot," >&2
+  echo "majd futtasd újra a telepítőt." >&2
 fi
 rm -f -- "$rar_probe"
 rar_probe=""
@@ -244,7 +233,7 @@ temp_config=$(mktemp "${config_dir}/config.json.XXXXXX")
 
 printf '%s\0' \
   "$qb_url" "$qb_username" "$qb_password" "$scan_root" "$work_root" \
-  "$seven_zip" "$mount_command" "$umount_command" "$service_user" \
+  "$unrar_command" "$mount_command" "$umount_command" "$service_user" \
   "$service_uid" "$service_gid" | \
   python3 -c '
 import json
@@ -262,7 +251,7 @@ if len(values) != 11:
     qb_password,
     scan_root,
     work_root,
-    seven_zip,
+    unrar_command,
     mount_command,
     umount_command,
     service_user,
@@ -279,7 +268,8 @@ with open(target, "w", encoding="utf-8") as handle:
             "qb_password": qb_password,
             "scan_root": scan_root,
             "work_root": work_root,
-            "seven_zip": seven_zip,
+            "unrar": unrar_command,
+            "seven_zip": "",
             "mount_command": mount_command,
             "umount_command": umount_command,
             "service_user": service_user,
