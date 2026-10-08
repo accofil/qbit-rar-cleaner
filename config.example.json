@@ -1,0 +1,17 @@
+{
+  "qb_url": "http://127.0.0.1:8080",
+  "qb_username": "accofil",
+  "qb_password": "CHANGE_ME",
+  "scan_root": "/home/accofil/storage",
+  "work_root": "/home/accofil/.cache/qbit-rar-cleaner-work",
+  "seven_zip": "/usr/bin/7z",
+  "mount_command": "/usr/bin/mount",
+  "umount_command": "/usr/bin/umount",
+  "service_user": "accofil",
+  "service_uid": 1000,
+  "service_gid": 1000,
+  "protected_tracker_domains": [
+    "aither.cc"
+  ],
+  "min_free_bytes": 1073741824
+}
