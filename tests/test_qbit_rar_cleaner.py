@@ -1003,5 +1003,78 @@ class IsoTransactionTests(unittest.TestCase):
             self.assertNotIn("remove-list-only", events)
 
 
+class LoggingTests(unittest.TestCase):
+    def setUp(self):
+        self._stdout, self._stderr = cleaner.sys.stdout, cleaner.sys.stderr
+
+    def tearDown(self):
+        cleaner.sys.stdout, cleaner.sys.stderr = self._stdout, self._stderr
+        for handle in (cleaner._RUN_LOG, cleaner._HISTORY_LOG):
+            if handle is not None:
+                handle.close()
+        cleaner._RUN_LOG = cleaner._HISTORY_LOG = None
+
+    def _setup(self, directory, apply=False):
+        args = cleaner.argparse.Namespace(apply=apply, yes=False)
+        return cleaner.setup_logging({"log_dir": str(directory)}, "iso", args)
+
+    def test_run_log_captures_output_and_history_only_actions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log_dir = Path(temporary) / "logs"
+            run_path = self._setup(log_dir, apply=True)
+
+            print("kimenet sor")
+            cleaner.log_event("csak futasnaplo")
+            cleaner.log_event("muvelet", action=True)
+            cleaner.sys.stdout.flush()
+
+            self.assertTrue(run_path.name.startswith("iso-"))
+            self.assertTrue(run_path.name.endswith("-apply.log"))
+            run_text = run_path.read_text(encoding="utf-8")
+            history_text = (log_dir / "history.log").read_text(encoding="utf-8")
+            self.assertIn("OUT kimenet sor", run_text)
+            self.assertIn("csak futasnaplo", run_text)
+            self.assertIn("muvelet", run_text)
+            self.assertIn("INDÍTÁS mód=iso apply=True", history_text)
+            self.assertIn("muvelet", history_text)
+            self.assertNotIn("csak futasnaplo", history_text)
+            self.assertNotIn("kimenet sor", history_text)
+            self.assertEqual(oct(run_path.stat().st_mode & 0o777), "0o640")
+
+    def test_dry_run_log_name_and_unwritable_dir_does_not_abort(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            blocker = Path(temporary) / "file"
+            blocker.write_text("x")
+            self.assertIsNone(self._setup(blocker / "logs"))
+            self.assertIsNone(cleaner._RUN_LOG)
+            run_path = self._setup(Path(temporary) / "ok")
+            self.assertTrue(run_path.name.endswith("-dryrun.log"))
+
+    def test_qbit_delete_is_logged_with_delete_files_false(self):
+        class Response:
+            status_code = 200
+
+        class Session:
+            def __init__(inner):
+                inner.sent = []
+
+            def post(inner, url, data=None, timeout=None):
+                inner.sent.append((url, data))
+                return Response()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run_path = self._setup(Path(temporary) / "logs")
+            client = cleaner.QbitClient("http://127.0.0.1:1", "user", "pass")
+            client.session = Session()
+            client.remove_list_only(["aa", "bb"])
+            text = run_path.read_text(encoding="utf-8")
+            self.assertIn("QBIT torrents/delete hashes=aa|bb", text)
+            self.assertIn("deleteFiles", text)
+            self.assertIn("'false'", text)
+            self.assertIn("HTTP 200", text)
+            self.assertEqual(client.session.sent[0][1]["deleteFiles"], "false")
+            self.assertNotIn("pass", text.replace("passkey", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
@@ -41,6 +42,89 @@ WORK_DIR_NAME = ".qbit-rar-cleaner-work"
 QUARANTINE_DIR_NAME = ".qbit-rar-cleaner-quarantine"
 STOPPED_STATES = {"stoppedUP", "stoppedDL", "pausedUP", "pausedDL"}
 DEFAULT_PROTECTED_TRACKER_DOMAINS = ("aither.cc",)
+
+
+_RUN_LOG = None
+_HISTORY_LOG = None
+
+
+def log_event(message: str, action: bool = False) -> None:
+    """Write a timestamped line to the run log (and the history log if action)."""
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    for handle in ((_RUN_LOG, _HISTORY_LOG) if action else (_RUN_LOG,)):
+        if handle is None:
+            continue
+        try:
+            for line in str(message).splitlines() or [""]:
+                prefix = f"{stamp} [{os.getpid()}] " if handle is _HISTORY_LOG else f"{stamp} "
+                handle.write(f"{prefix}{line}\n")
+            handle.flush()
+        except (OSError, ValueError):
+            pass
+
+
+class _Tee:
+    """Copy everything written to stdout/stderr into the run log."""
+
+    def __init__(self, stream, label: str):
+        self._stream = stream
+        self._label = label
+        self._pending = ""
+
+    def write(self, data: str) -> int:
+        written = self._stream.write(data)
+        self._pending += data
+        while "\n" in self._pending:
+            line, self._pending = self._pending.split("\n", 1)
+            log_event(f"{self._label} {line}")
+        return written
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def __getattr__(self, name: str):
+        return getattr(self._stream, name)
+
+
+def setup_logging(
+    config: dict[str, object], mode: str, args: argparse.Namespace
+) -> Path | None:
+    """Open <log_dir>/<mode>-<time>[-apply].log and a shared history.log."""
+    global _RUN_LOG, _HISTORY_LOG
+    try:
+        log_dir = Path(
+            str(config.get("log_dir") or Path.home() / "logs" / "qbit-rar-cleaner")
+        ).expanduser()
+        log_dir.mkdir(parents=True, mode=0o750, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        suffix = "apply" if args.apply else "dryrun"
+        run_path = log_dir / f"{mode}-{stamp}-{suffix}.log"
+        history_path = log_dir / "history.log"
+        owner = None
+        if os.geteuid() == 0 and config.get("service_uid") is not None:
+            owner = (int(config["service_uid"]), int(config["service_gid"]))
+        paths = (run_path, history_path)
+        handles = []
+        for path in paths:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o640)
+            if owner is not None:
+                os.fchown(descriptor, owner[0], owner[1])
+            handles.append(os.fdopen(descriptor, "a", encoding="utf-8"))
+        if owner is not None:
+            os.chown(log_dir, owner[0], owner[1])
+        _RUN_LOG, _HISTORY_LOG = handles
+    except OSError as exc:
+        print(f"FIGYELEM: a naplózás nem indítható: {exc}", file=sys.stderr)
+        return None
+    sys.stdout = _Tee(sys.stdout, "OUT")
+    sys.stderr = _Tee(sys.stderr, "ERR")
+    log_event(
+        f"INDÍTÁS mód={mode} apply={args.apply} yes={args.yes} "
+        f"felhasználó={os.geteuid()} parancs={' '.join(sys.argv)}",
+        action=True,
+    )
+    log_event(f"Naplófájl: {run_path}", action=True)
+    return run_path
 
 
 class CleanerError(RuntimeError):
@@ -428,6 +512,11 @@ class QbitClient:
         response = self.session.post(
             self._url(endpoint), data=payload, timeout=self.timeout
         )
+        log_event(
+            f"QBIT {endpoint} hashes={payload['hashes']} "
+            f"{ {k: v for k, v in data.items()} } -> HTTP {response.status_code}",
+            action=True,
+        )
         if response.status_code != 200:
             raise ApiError(f"qBittorrent {endpoint} sikertelen: HTTP {response.status_code}")
 
@@ -778,7 +867,11 @@ class SevenZip:
             env=env,
             check=False,
         )
+        log_event(
+            f"7Z {' '.join(arguments)} -> exit={completed.returncode}", action=True
+        )
         if completed.returncode != 0:
+            log_event(f"7Z kimenet:\n{completed.stdout}")
             tail = "\n".join(completed.stdout.splitlines()[-20:])
             raise ArchiveError(
                 f"7-Zip hiba (exit={completed.returncode}):\n{tail}"
@@ -850,7 +943,11 @@ class IsoMounter:
             stderr=subprocess.STDOUT,
             check=False,
         )
+        log_event(
+            f"CMD {' '.join(command)} -> exit={completed.returncode}", action=True
+        )
         if completed.returncode != 0:
+            log_event(f"CMD kimenet:\n{completed.stdout}")
             tail = "\n".join(completed.stdout.splitlines()[-20:])
             raise IsoError(
                 f"Parancshiba (exit={completed.returncode}): {' '.join(command[:2])}\n{tail}"
@@ -1081,6 +1178,7 @@ def move_file_cross_device(
     destination: Path,
     owner: tuple[int, int] | None = None,
 ) -> None:
+    log_event(f"MOVE {source} -> {destination}")
     try:
         os.replace(source, destination)
     except OSError as exc:
@@ -1138,6 +1236,9 @@ def merge_staged_files(
                     raise ArchiveError(
                         f"Eltérő tartalmú célfájl már létezik: {item.destination}"
                     )
+                log_event(
+                    f"SKIP (azonos tartalmú cél már létezik): {item.destination}"
+                )
                 item.source.unlink()
                 continue
             move_file_cross_device(item.source, item.destination, owner)
@@ -1234,6 +1335,13 @@ def process_component(
     ]
     quarantine_moves: list[tuple[Path, Path]] = []
     removed_from_qbit = False
+    log_event(
+        f"RAR TRANZAKCIÓ {transaction_id} indul; torrentek: "
+        + "; ".join(f"{h} {torrent_by_hash[h].name}" for h in hashes)
+        + "; archívumok: "
+        + "; ".join(str(a.first_volume) for a in component.archive_sets),
+        action=True,
+    )
 
     try:
         expected_bytes = 0
@@ -1283,12 +1391,17 @@ def process_component(
             quarantined.parent.mkdir(parents=True, exist_ok=True)
             os.replace(volume, quarantined)
             quarantine_moves.append((volume, quarantined))
+            log_event(f"QUARANTINE {volume} -> {quarantined}")
 
         # qBittorrent is list-only here. File deletion is exclusively above/below.
         client.remove_list_only(hashes)
         wait_for_removed(client, hashes)
         removed_from_qbit = True
 
+        log_event(
+            f"TÖRLÉS: RAR-karantén {quarantine_root} ({len(quarantine_moves)} kötet)",
+            action=True,
+        )
         shutil.rmtree(quarantine_root)
         try:
             quarantine_root.parent.rmdir()
@@ -1298,6 +1411,11 @@ def process_component(
         names = ", ".join(torrent_by_hash[item].name for item in hashes)
         return True, f"SIKER: {names}"
     except BaseException as exc:  # noqa: BLE001 - transaction rollback boundary
+        log_event(
+            f"RAR TRANZAKCIÓ {transaction_id} HIBA, visszaállítás: {exc!r}\n"
+            + traceback.format_exc(),
+            action=True,
+        )
         if not removed_from_qbit:
             restore_quarantine(quarantine_moves)
             remove_empty_quarantine(quarantine_root)
@@ -1352,6 +1470,13 @@ def process_iso_component(
     removed_from_qbit = False
     completed = False
     unmount_failed = False
+    log_event(
+        f"ISO TRANZAKCIÓ {transaction_id} indul; ISO-k: "
+        + "; ".join(str(i.path) for i in component.images)
+        + "; torrentek: "
+        + ("; ".join(f"{h} {torrent_by_hash[h].name}" for h in hashes) or "nincs"),
+        action=True,
+    )
 
     try:
         transaction.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -1363,6 +1488,10 @@ def process_iso_component(
             image_path = resolve_existing_file(image.path, scan_root)
             existing_bdmv, replace_bdmv = bdmv_structure_state(image_path.parent)
             if existing_bdmv is not None:
+                log_event(
+                    f"ISO másolás kihagyva (teljes BDMV már megvan): {existing_bdmv}",
+                    action=True,
+                )
                 print(
                     f"  Meglévő teljes BDMV, ISO mount nélkül törlendő: {existing_bdmv}"
                 )
@@ -1434,6 +1563,10 @@ def process_iso_component(
             quarantined.parent.mkdir(parents=True, exist_ok=True)
             os.replace(bdmv_path, quarantined)
             replacement_moves.append((bdmv_path, quarantined))
+            log_event(
+                f"BDMV-CSERE: régi részleges BDMV karanténba: {bdmv_path} -> {quarantined}",
+                action=True,
+            )
 
         merge_staged_tree(stages, scan_root, output_owner)
         if replacement_root.exists():
@@ -1451,6 +1584,7 @@ def process_iso_component(
             quarantined.parent.mkdir(parents=True, exist_ok=True)
             os.replace(image.path, quarantined)
             iso_quarantine_moves.append((image.path, quarantined))
+            log_event(f"QUARANTINE ISO {image.path} -> {quarantined}")
 
         if hashes:
             # This is intentionally and permanently list-only.
@@ -1458,6 +1592,11 @@ def process_iso_component(
             wait_for_removed(client, hashes)
             removed_from_qbit = True
 
+        log_event(
+            f"TÖRLÉS: ISO-karantén {quarantine_root} "
+            f"({len(iso_quarantine_moves)} ISO)",
+            action=True,
+        )
         shutil.rmtree(quarantine_root)
         try:
             quarantine_root.parent.rmdir()
@@ -1477,6 +1616,11 @@ def process_iso_component(
             "ezért a kliensben nem történt módosítás"
         )
     except BaseException as exc:  # noqa: BLE001 - transaction rollback boundary
+        log_event(
+            f"ISO TRANZAKCIÓ {transaction_id} HIBA, visszaállítás: {exc!r}\n"
+            + traceback.format_exc(),
+            action=True,
+        )
         if not removed_from_qbit:
             restore_quarantine(iso_quarantine_moves)
             restore_quarantine(replacement_moves)
@@ -1697,6 +1841,7 @@ def run_rar_mode(
             min_free_bytes,
         )
         print(message)
+        log_event(f"EREDMÉNY {index}/{len(components)}: {message}", action=True)
         failures += 0 if success else 1
     return 1 if failures else 0
 
@@ -1765,6 +1910,7 @@ def run_iso_mode(
             output_owner,
         )
         print(message)
+        log_event(f"EREDMÉNY {index}/{len(components)}: {message}", action=True)
         failures += 0 if success else 1
     return 1 if failures else 0
 
@@ -1799,6 +1945,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ):
             raise CleanerError(f"A munkakönyvtár nem használható: {work_root}")
 
+        setup_logging(config, mode, args)
         lock_handle = acquire_lock(work_root / ".operation.lock")
         client = QbitClient(
             str(config["qb_url"]),
@@ -1808,16 +1955,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         client.login()
         protected_domains = protected_domains_from_config(config)
 
-        if mode == "iso":
-            return run_iso_mode(
-                args,
-                config,
-                client,
-                scan_root,
-                work_root,
-                protected_domains,
-            )
-        return run_rar_mode(
+        runner = run_iso_mode if mode == "iso" else run_rar_mode
+        exit_code = runner(
             args,
             config,
             client,
@@ -1825,9 +1964,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             work_root,
             protected_domains,
         )
+        log_event(f"VÉGE kilépési kód={exit_code}", action=True)
+        return exit_code
     except (CleanerError, requests.RequestException, OSError, ValueError) as exc:
         print(f"HIBA: {exc}", file=sys.stderr)
+        log_event("HIBA részletei:\n" + traceback.format_exc(), action=True)
         return 1
+    except BaseException:
+        log_event("VÁRATLAN LEÁLLÁS:\n" + traceback.format_exc(), action=True)
+        raise
     finally:
         if lock_handle is not None:
             lock_handle.close()

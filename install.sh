@@ -95,6 +95,7 @@ fi
 
 missing_packages=()
 command -v python3 >/dev/null 2>&1 || missing_packages+=(python3)
+command -v tmux >/dev/null 2>&1 || missing_packages+=(tmux)
 python3 -m venv --help >/dev/null 2>&1 || missing_packages+=(python3-venv)
 if ! command -v mount >/dev/null 2>&1 || \
    ! command -v umount >/dev/null 2>&1 || \
@@ -229,6 +230,8 @@ python3 -m venv "${INSTALL_DIR}/venv"
 "${INSTALL_DIR}/venv/bin/pip" install --disable-pip-version-check \
   -r "${INSTALL_DIR}/requirements.txt"
 
+log_dir="${service_home}/logs/${PROJECT_NAME}"
+install -d -o "$service_user" -g "$service_group" -m 0750 "${service_home}/logs" "$log_dir"
 config_dir="${service_home}/.config/${PROJECT_NAME}"
 config_file="${config_dir}/config.json"
 install -d -o "$service_user" -g "$service_group" -m 0700 "$config_dir"
@@ -245,7 +248,7 @@ temp_config=$(mktemp "${config_dir}/config.json.XXXXXX")
 printf '%s\0' \
   "$qb_url" "$qb_username" "$qb_password" "$scan_root" "$work_root" \
   "$seven_zip" "$mount_command" "$umount_command" "$service_user" \
-  "$service_uid" "$service_gid" | \
+  "$service_uid" "$service_gid" "$log_dir" | \
   python3 -c '
 import json
 import sys
@@ -254,7 +257,7 @@ target = sys.argv[1]
 values = sys.stdin.buffer.read().split(b"\0")
 if values and values[-1] == b"":
     values.pop()
-if len(values) != 11:
+if len(values) != 12:
     raise SystemExit("invalid installer input")
 (
     qb_url,
@@ -268,6 +271,7 @@ if len(values) != 11:
     service_user,
     service_uid,
     service_gid,
+    log_dir,
 ) = (
     value.decode("utf-8") for value in values
 )
@@ -285,6 +289,7 @@ with open(target, "w", encoding="utf-8") as handle:
             "service_user": service_user,
             "service_uid": int(service_uid),
             "service_gid": int(service_gid),
+            "log_dir": log_dir,
             "protected_tracker_domains": ["aither.cc"],
             "min_free_bytes": 1073741824,
         },
@@ -299,20 +304,58 @@ chmod 0600 "$temp_config"
 mv -f -- "$temp_config" "$config_file"
 unset qb_password
 
+# A wrapperek tmux-munkamenetben futtatják a feldolgozást; hiányzó tmuxot
+# futáskor is telepítenek. Tty nélkül (pl. cron, pipe) közvetlenül futnak.
+read -r -d '' tmux_helper <<'EOS' || true
+ensure_tmux() {
+  command -v tmux >/dev/null 2>&1 && return 0
+  echo "A tmux nincs telepítve, automatikus telepítés..." >&2
+  local -a sudo_cmd=()
+  if [[ $(id -u) -ne 0 ]]; then sudo_cmd=(sudo); fi
+  "${sudo_cmd[@]}" apt-get update >&2 || true
+  DEBIAN_FRONTEND=noninteractive "${sudo_cmd[@]}" apt-get install -y tmux >&2 || true
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "A tmux telepítése nem sikerült: sudo apt-get install tmux" >&2
+    exit 1
+  fi
+}
+relaunch_in_tmux() {
+  local session=$1
+  shift
+  if [[ -n ${TMUX:-} || -n ${QBIT_CLEANER_IN_TMUX:-} ]]; then return 0; fi
+  if [[ ! -t 0 || ! -t 1 ]]; then return 0; fi
+  ensure_tmux
+  local -a t=(tmux)
+  if [[ $(id -u) -eq 0 && -n ${TMUX_USER:-} ]]; then
+    t=(runuser -u "$TMUX_USER" -- tmux)
+  fi
+  if "${t[@]}" has-session -t "=$session" 2>/dev/null; then
+    echo "A(z) $session tmux-munkamenet már fut, csatlakozom (az új paramétereket nem veszi figyelembe)." >&2
+    exec "${t[@]}" attach-session -t "=$session"
+  fi
+  exec "${t[@]}" new-session -s "$session" -- bash -c \
+    'env QBIT_CLEANER_IN_TMUX=1 "$@"; rc=$?; echo; read -r -p "Kész (kilépési kód: $rc). Enter a munkamenet bezárásához..." _; exit "$rc"' \
+    _ "$0" "$@"
+}
+EOS
+
 temp_rar_wrapper=$(mktemp)
 cat >"$temp_rar_wrapper" <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
+TMUX_USER=${service_user@Q}
+${tmux_helper}
+if [[ \$(id -u) -ne 0 && \$(id -un) != ${service_user@Q} ]]; then
+  echo "Ezt a parancsot ${service_user@Q} felhasználóként vagy rootként futtasd." >&2
+  exit 1
+fi
+relaunch_in_tmux qbit-rar-cleaner "\$@"
 if [[ \$(id -u) -eq 0 ]]; then
   exec runuser -u ${service_user@Q} -- \
     env QBIT_CLEANER_MODE=rar \
     ${INSTALL_DIR@Q}/venv/bin/python \
     ${INSTALL_DIR@Q}/qbit_rar_cleaner.py \
     --config ${config_file@Q} "\$@"
-fi
-if [[ \$(id -un) != ${service_user@Q} ]]; then
-  echo "Ezt a parancsot ${service_user@Q} felhasználóként vagy rootként futtasd." >&2
-  exit 1
 fi
 exec env QBIT_CLEANER_MODE=rar \
   ${INSTALL_DIR@Q}/venv/bin/python \
@@ -326,10 +369,12 @@ temp_iso_wrapper=$(mktemp)
 cat >"$temp_iso_wrapper" <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
+${tmux_helper}
 if [[ \$(id -u) -ne 0 ]]; then
   echo "Az ISO mountolásához root jogosultság kell: sudo qbit-iso-cleaner" >&2
   exit 1
 fi
+relaunch_in_tmux qbit-iso-cleaner "\$@"
 exec ${unshare_command@Q} --mount --propagation private -- \
   env QBIT_CLEANER_MODE=iso \
   ${INSTALL_DIR@Q}/venv/bin/python \
@@ -353,6 +398,7 @@ fi
 
 echo
 echo "Telepítés kész."
+echo "Naplók: ${log_dir} (futásonként külön fájl + history.log)"
 echo "RAR parancs: ${RAR_COMMAND_PATH}"
 echo "ISO parancs: ${ISO_COMMAND_PATH}"
 echo "Valódi RAR-futás: sudo ${RAR_COMMAND_PATH} --apply"

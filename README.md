@@ -249,6 +249,7 @@ nem működik.
 - a qBittorrent Linux-felhasználójának teljes hozzáférése a scan roothoz;
 - a RAR-módhoz RAR-támogatású 7-Zip;
 - util-linux csomag a mount, umount és unshare parancsokhoz;
+- tmux (a telepítő felrakja; ha hiányzik, a parancsok induláskor maguk telepítik);
 - loop eszköz és ISO9660/UDF támogatás a Linux kernelben;
 - internetkapcsolat a telepítéshez szükséges csomagok letöltéséhez.
 
@@ -427,6 +428,22 @@ ISO_FELDOLGOZOM
 
 Más szöveg esetén módosítás nélkül leáll.
 
+### tmux-munkamenet
+
+Mindkét parancs interaktív terminálból tmux-munkamenetben fut
+(`qbit-rar-cleaner` és `qbit-iso-cleaner` nevű munkamenet), így az SSH-kapcsolat
+megszakadása nem állítja le a feldolgozást.
+
+- A RAR-parancs a telepítéskor megadott Linux-felhasználó tmux-szerverén fut
+  (`sudo` mellett is), az ISO-parancs a rooton.
+- Futás után a munkamenet "Kész (kilépési kód: …)" üzenettel vár egy Enterre, hogy
+  az eredmény olvasható maradjon.
+- Ha az adott munkamenet már fut, a parancs csatlakozik hozzá; az újonnan megadott
+  paramétereket ilyenkor nem veszi figyelembe.
+- Leválás: `Ctrl+b`, majd `d`. Visszacsatlakozás: ugyanaz a parancs.
+- Ha nincs tmux, a parancs automatikusan telepíti (`apt-get`, nem rootként `sudo`).
+- Terminál nélkül (cron, pipe) a tmux-ot kihagyja és közvetlenül fut.
+
 ### Felügyelet nélküli futtatás
 
 RAR:
@@ -472,6 +489,24 @@ ajánlott. Előtte mindig futtasd és olvasd végig a megfelelő próbaüzemet.
 - már sikeresen létrejött, azonos kimeneti fájlok megmaradhatnak, így a futás
   később biztonságosan folytatható.
 
+## Naplózás
+
+Minden futás naplót ír a `~/logs/qbit-rar-cleaner/` mappába (a telepítő
+konfigurációjában a `log_dir` mező; a fájlok 0640 jogosultságúak és a Linux-felhasználóé,
+akkor is, ha a parancs rootként fut):
+
+| Fájl | Tartalom |
+|---|---|
+| `rar-<idő>-dryrun.log`, `rar-<idő>-apply.log` | A teljes képernyőkimenet és minden művelet időbélyeggel, a hibák traceback-jével |
+| `iso-<idő>-dryrun.log`, `iso-<idő>-apply.log` | Ugyanez az ISO-módra |
+| `history.log` | Közös, hozzáfűzős napló csak a lényeges eseményekkel, PID-del |
+
+A naplóban szerepel: az indítás paraméterei, a tranzakciók (torrent hash és név,
+archívumok vagy ISO-k), a qBittorrent-hívások a válaszkódjukkal (a törlés mindig
+`deleteFiles=false`), a 7z- és mount/umount-parancsok és kilépési kódjuk, a
+fájlmozgatások, a karanténba helyezés és a törlés, a BDMV-csere, a visszaállítások
+és az eredmény. A jelszó nem kerül a naplóba. A régi naplókat nem törli a program.
+
 ## Telepített fájlok
 
 | Elem | Hely |
@@ -481,6 +516,7 @@ ajánlott. Előtte mindig futtasd és olvasd végig a megfelelő próbaüzemet.
 | ISO-parancs | /usr/local/bin/qbit-iso-cleaner |
 | Beállítások | ~/.config/qbit-rar-cleaner/config.json |
 | NVMe munkamappa | ~/.cache/qbit-rar-cleaner-work/ |
+| Naplók | ~/logs/qbit-rar-cleaner/ |
 | Átmeneti storage-karantén | &lt;scan_root&gt;/.qbit-rar-cleaner-quarantine/ |
 
 A konfigurációs mappa 0700, a konfigurációs fájl 0600 jogosultságot kap. A
