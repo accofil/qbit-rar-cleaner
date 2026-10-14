@@ -489,6 +489,18 @@ ajánlott. Előtte mindig futtasd és olvasd végig a megfelelő próbaüzemet.
 - már sikeresen létrejött, azonos kimeneti fájlok megmaradhatnak, így a futás
   később biztonságosan folytatható.
 
+## Eltérő kis- és nagybetűs kötetnevek
+
+Egyes scene kiadásokban a RAR-kötetek nevének kis- és nagybetűs írása vegyes
+(`….pfa.r01`, mellette `….PFa.r02`). A 7-Zip az első kötet nevéből építi a többi kötet
+nevét, és kis- és nagybetű különbséggel keresi őket, ezért `Missing volume` hibával
+leáll, pedig minden kötet megvan. A program ilyenkor a munkamappában átmeneti
+szimlinkekből álló könyvtárat készít a várt nevekkel, és azon keresztül futtatja a
+7-Zip-et. A valódi fájlokat nem nevezi át és nem módosítja, a szimlinkeket a
+tranzakció végén törli. Két, csak kis- és nagybetűben eltérő kötet közül a pontos nevűt
+használja, de csak akkor, ha a méretük azonos; különben megáll. A naplóban
+`KÖTETNÉV-ALIAS` sor jelzi.
+
 ## Naplózás
 
 Minden futás naplót ír a `~/logs/qbit-rar-cleaner/` mappába (a telepítő

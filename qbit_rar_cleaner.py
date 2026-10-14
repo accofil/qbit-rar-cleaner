@@ -9,6 +9,7 @@ entries with deleteFiles=false. RAR and ISO processing are separate modes.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import fcntl
 import hashlib
@@ -24,7 +25,7 @@ import time
 import traceback
 import uuid
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import urlsplit
@@ -853,6 +854,84 @@ def _safe_archive_member(raw_path: str) -> Path:
     return Path(*posix.parts)
 
 
+def expected_volume_names(archive_set: ArchiveSet) -> dict[Path, str]:
+    """Names 7-Zip will look up for every volume, derived from the first one.
+
+    7-Zip builds the names of the following volumes from the first volume's
+    name and opens them case-sensitively.  Some releases mix the case of the
+    volume names (``….pfa.r01`` next to ``….PFa.r02``), which fails with
+    "Missing volume" although every volume is present.
+    """
+
+    first = archive_set.first_volume
+    names: dict[Path, str] = {}
+    part_first = PART_RAR_RE.match(first.name)
+    for volume in archive_set.volumes:
+        if volume == first:
+            names[volume] = first.name
+            continue
+        if part_first is not None:
+            part = PART_RAR_RE.match(volume.name)
+            if part is None:
+                raise ArchiveError(f"Váratlan kötetnév: {volume.name}")
+            prefix = part_first.group("prefix")
+            tail = first.name[len(prefix):]
+            width = len(part_first.group("number"))
+            names[volume] = prefix + re.sub(
+                r"\d+", f"{int(part.group('number')):0{width}d}", tail, count=1
+            )
+            continue
+        old = OLD_VOLUME_RE.match(volume.name)
+        if old is None:
+            raise ArchiveError(f"Váratlan kötetnév: {volume.name}")
+        letter = old.group("letter")
+        letter = letter.lower() if first.suffix == first.suffix.lower() else letter.upper()
+        names[volume] = f"{first.stem}.{letter}{old.group('number')}"
+    return names
+
+
+@contextlib.contextmanager
+def openable_first_volume(archive_set: ArchiveSet, links_root: Path) -> Iterator[Path]:
+    """Yield the first-volume path to hand to 7-Zip.
+
+    Normally that is the real file.  When volume names differ from what 7-Zip
+    will look for only in case, a private directory of symlinks with the
+    expected names is built (the real files are never renamed or touched).
+    """
+
+    expected = expected_volume_names(archive_set)
+    if all(volume.name == name for volume, name in expected.items()):
+        yield archive_set.first_volume
+        return
+
+    chosen: dict[str, Path] = {}
+    for volume, name in sorted(expected.items(), key=lambda item: str(item[0])):
+        current = chosen.get(name)
+        if current is None:
+            chosen[name] = volume
+            continue
+        if current.stat().st_size != volume.stat().st_size:
+            raise ArchiveError(
+                f"Két eltérő méretű kötet ugyanazt a kötetnevet adja: {current.name}, {volume.name}"
+            )
+        if volume.name == name:
+            chosen[name] = volume  # prefer the file whose name is already exact
+
+    link_dir = links_root / uuid.uuid4().hex
+    link_dir.mkdir(parents=True, mode=0o700)
+    try:
+        for name, volume in chosen.items():
+            (link_dir / name).symlink_to(volume)
+        log_event(
+            f"KÖTETNÉV-ALIAS: {len(chosen)} kötet szimlinkelve a 7-Zip számára "
+            f"(kisbetű/nagybetű eltérés): {archive_set.first_volume}",
+            action=True,
+        )
+        yield link_dir / archive_set.first_volume.name
+    finally:
+        shutil.rmtree(link_dir, ignore_errors=True)
+
+
 class SevenZip:
     def __init__(self, executable: str):
         self.executable = executable
@@ -1326,6 +1405,7 @@ def process_component(
     transaction_id = f"txn-{uuid.uuid4().hex}"
     transaction = work_root / transaction_id
     extract_root = transaction / "extract"
+    links_root = work_root / f"{transaction_id}-links"
     quarantine_root = scan_root / QUARANTINE_DIR_NAME / transaction_id
     hashes = sorted(component.torrent_hashes)
     originally_running = [
@@ -1347,8 +1427,9 @@ def process_component(
         expected_bytes = 0
         entries_by_set: list[tuple[ArchiveSet, tuple[ArchiveEntry, ...]]] = []
         for archive_set in component.archive_sets:
-            extractor.test(archive_set.first_volume)
-            entries = extractor.entries(archive_set.first_volume)
+            with openable_first_volume(archive_set, links_root) as openable:
+                extractor.test(openable)
+                entries = extractor.entries(openable)
             expected_bytes += sum(entry.size for entry in entries if not entry.is_directory)
             entries_by_set.append((archive_set, entries))
 
@@ -1373,7 +1454,8 @@ def process_component(
         stages: list[tuple[Path, Path]] = []
         for index, (archive_set, _) in enumerate(entries_by_set):
             stage = extract_root / str(index)
-            extractor.extract(archive_set.first_volume, stage)
+            with openable_first_volume(archive_set, links_root) as openable:
+                extractor.extract(openable, stage)
             stages.append((stage, archive_set.first_volume.parent))
 
         merge_staged_tree(stages, scan_root)
@@ -1437,6 +1519,7 @@ def process_component(
             raise
         return False, f"HIBA: {exc}"
     finally:
+        shutil.rmtree(links_root, ignore_errors=True)
         if transaction.exists() and not removed_from_qbit:
             shutil.rmtree(transaction, ignore_errors=True)
 

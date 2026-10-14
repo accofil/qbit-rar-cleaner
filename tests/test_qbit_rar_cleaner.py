@@ -1076,5 +1076,145 @@ class LoggingTests(unittest.TestCase):
             self.assertNotIn("pass", text.replace("passkey", ""))
 
 
+class MixedCaseVolumeTests(unittest.TestCase):
+    STEM = "audie.murphy.vol1.complete.bluray-pfa"
+
+    def make_set(self, root, names, sizes=None):
+        paths = []
+        for name in names:
+            data = b"x" * (sizes or {}).get(name, 3)
+            paths.append(touch(root / "Release" / name, data))
+        first = next(path for path in paths if path.name.lower().endswith(".rar"))
+        return cleaner.ArchiveSet(first, tuple(paths), frozenset({"h" * 40}))
+
+    def test_expected_names_follow_the_first_volumes_case(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            archive_set = self.make_set(
+                root,
+                [f"{self.STEM}.rar", f"{self.STEM}.r00", "Audie.Murphy.VOL1.PFa.r01"],
+            )
+            expected = cleaner.expected_volume_names(archive_set)
+        self.assertEqual(
+            sorted(expected.values()),
+            sorted([f"{self.STEM}.rar", f"{self.STEM}.r00", f"{self.STEM}.r01"]),
+        )
+
+    def test_modern_part_names_are_normalised_too(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            archive_set = self.make_set(
+                root, ["movie.part01.rar", "Movie.PART02.rar", "movie.part03.rar"]
+            )
+            expected = cleaner.expected_volume_names(archive_set)
+        self.assertEqual(
+            sorted(expected.values()),
+            ["movie.part01.rar", "movie.part02.rar", "movie.part03.rar"],
+        )
+
+    def test_consistent_names_need_no_links(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            archive_set = self.make_set(root, [f"{self.STEM}.rar", f"{self.STEM}.r00"])
+            links_root = root / "links"
+            with cleaner.openable_first_volume(archive_set, links_root) as path:
+                self.assertEqual(path, archive_set.first_volume)
+            self.assertFalse(links_root.exists())
+
+    def test_mixed_case_volumes_get_temporary_symlinks_and_are_cleaned_up(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            archive_set = self.make_set(
+                root,
+                [
+                    f"{self.STEM}.rar",
+                    f"{self.STEM}.r00",
+                    "Audie.Murphy.VOL1.PFa.r01",
+                    f"{self.STEM}.r02",
+                    "Audie.Murphy.VOL1.PFa.r02",  # case duplicate of r02, same size
+                ],
+            )
+            links_root = root / "links"
+            with cleaner.openable_first_volume(archive_set, links_root) as path:
+                names = sorted(item.name for item in path.parent.iterdir())
+                self.assertEqual(path.name, f"{self.STEM}.rar")
+                self.assertTrue(path.is_symlink() or path.exists())
+                resolved = (path.parent / f"{self.STEM}.r01").resolve()
+                self.assertEqual(resolved.name, "Audie.Murphy.VOL1.PFa.r01")
+                self.assertEqual(
+                    (path.parent / f"{self.STEM}.r02").resolve().name,
+                    f"{self.STEM}.r02",
+                )
+            self.assertEqual(
+                names,
+                sorted(f"{self.STEM}.{suffix}" for suffix in ("rar", "r00", "r01", "r02")),
+            )
+            self.assertEqual(list(links_root.iterdir()), [])
+            # the real files are untouched
+            self.assertTrue((root / "Release" / "Audie.Murphy.VOL1.PFa.r01").exists())
+            self.assertTrue((root / "Release" / f"{self.STEM}.r01").exists() is False)
+
+    def test_case_duplicates_with_different_sizes_are_refused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            archive_set = self.make_set(
+                root,
+                [f"{self.STEM}.rar", f"{self.STEM}.r00", "Audie.Murphy.VOL1.PFa.r00"],
+                sizes={"Audie.Murphy.VOL1.PFa.r00": 9},
+            )
+            with self.assertRaises(cleaner.ArchiveError):
+                with cleaner.openable_first_volume(archive_set, root / "links"):
+                    pass
+
+    def test_process_component_hands_the_alias_to_the_extractor(self):
+        seen = []
+
+        class Recording(FakeExtractor):
+            def test(inner, first_volume):
+                seen.append(("test", first_volume))
+
+            def entries(inner, first_volume):
+                seen.append(("entries", first_volume))
+                return super().entries(first_volume)
+
+            def extract(inner, first_volume, destination):
+                seen.append(("extract", first_volume))
+                return super().extract(first_volume, destination)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            archive_set = self.make_set(
+                root, [f"{self.STEM}.rar", "Audie.Murphy.VOL1.PFa.r00"]
+            )
+            torrent = cleaner.Torrent(
+                hash="h" * 40,
+                name="Release",
+                state="stalledUP",
+                progress=1,
+                save_path=root,
+                content_path=root / "Release",
+            )
+            component = cleaner.Component((archive_set,), frozenset({torrent.hash}))
+            work_root = root / cleaner.WORK_DIR_NAME
+            success, message = cleaner.process_component(
+                component,
+                {torrent.hash: torrent},
+                FakeMutationClient(torrent),
+                Recording(),
+                root,
+                work_root,
+                0,
+            )
+            leftovers = [item for item in work_root.iterdir() if item.name.endswith("-links")]
+
+        self.assertTrue(success, message)
+        self.assertEqual([step for step, _ in seen], ["test", "entries", "extract"])
+        for _, path in seen:
+            self.assertEqual(path.name, f"{self.STEM}.rar")
+            self.assertNotEqual(path, archive_set.first_volume)  # went through the link dir
+            self.assertIn("-links", str(path))
+        self.assertEqual(leftovers, [])
+
+
 if __name__ == "__main__":
     unittest.main()
