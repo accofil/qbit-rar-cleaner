@@ -1216,5 +1216,160 @@ class MixedCaseVolumeTests(unittest.TestCase):
         self.assertEqual(leftovers, [])
 
 
+class CopyModeTests(unittest.TestCase):
+    def make_torrent(self, root, name="Release"):
+        return cleaner.Torrent(
+            hash="c" * 40,
+            name=name,
+            state="stalledUP",
+            progress=1,
+            save_path=root / "torrents",
+            content_path=root / "torrents" / name,
+        )
+
+    def test_rar_copy_keeps_volumes_and_torrent_and_uses_release_name(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            first = touch(root / "torrents" / "Release" / "release.rar", b"archive")
+            nfo = touch(root / "torrents" / "Release" / "release.nfo", b"nfo")
+            output = root / "upload"
+            output.mkdir()
+            torrent = self.make_torrent(root)
+            archive_set = cleaner.ArchiveSet(first, (first,), frozenset({torrent.hash}))
+            component = cleaner.Component((archive_set,), frozenset({torrent.hash}))
+            client = FakeMutationClient(torrent)
+            todo, targets, skipped = cleaner.plan_copy_targets(
+                [(component, [(first, archive_set.owners)])],
+                {torrent.hash: torrent},
+                output,
+            )
+            self.assertEqual(todo, [component])
+            self.assertEqual(skipped, [])
+            self.assertEqual(targets[first], output / "Release")
+
+            success, message = cleaner.process_component(
+                component,
+                {torrent.hash: torrent},
+                client,
+                FakeExtractor(),
+                root / "torrents",
+                root / "work",
+                0,
+                {first: targets[first]},
+                output,
+            )
+
+            self.assertTrue(success, message)
+            self.assertTrue(first.exists())
+            self.assertTrue(nfo.exists())
+            self.assertEqual((output / "Release" / "movie.mkv").read_bytes(), b"movie")
+            self.assertEqual(sorted(p.name for p in (output / "Release").iterdir()), ["movie.mkv"])
+            self.assertFalse(client.stopped or client.removed or client.started)
+
+    def test_subfolder_archive_keeps_relative_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            touch(root / "torrents" / "Release" / "release.rar")
+            subs = touch(root / "torrents" / "Release" / "Subs" / "subs.rar")
+            torrent = self.make_torrent(root)
+            release, destination = cleaner.copy_destination(
+                subs, {torrent.hash}, {torrent.hash: torrent}, root / "upload"
+            )
+            self.assertEqual(release, root / "upload" / "Release")
+            self.assertEqual(destination, root / "upload" / "Release" / "Subs")
+
+    def test_existing_output_folder_is_skipped(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            first = touch(root / "torrents" / "Release" / "release.rar")
+            (root / "upload" / "Release").mkdir(parents=True)
+            torrent = self.make_torrent(root)
+            todo, targets, skipped = cleaner.plan_copy_targets(
+                [("component", [(first, {torrent.hash})])],
+                {torrent.hash: torrent},
+                root / "upload",
+            )
+            self.assertEqual(todo, [])
+            self.assertEqual(targets, {})
+            self.assertEqual(skipped[0][1], root / "upload" / "Release")
+
+    def test_failed_copy_leaves_no_output_folder(self):
+        class BrokenExtractor(FakeExtractor):
+            def extract(self, first_volume, destination):
+                raise cleaner.ArchiveError("broken")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            first = touch(root / "torrents" / "Release" / "release.rar")
+            output = root / "upload"
+            output.mkdir()
+            torrent = self.make_torrent(root)
+            archive_set = cleaner.ArchiveSet(first, (first,), frozenset({torrent.hash}))
+            component = cleaner.Component((archive_set,), frozenset({torrent.hash}))
+            success, _ = cleaner.process_component(
+                component,
+                {torrent.hash: torrent},
+                FakeMutationClient(torrent),
+                BrokenExtractor(),
+                root / "torrents",
+                root / "work",
+                0,
+                {first: output / "Release"},
+                output,
+            )
+            self.assertFalse(success)
+            self.assertEqual(list(output.iterdir()), [])
+            self.assertTrue(first.exists())
+
+    def test_scan_skips_excluded_output_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            touch(root / "Release" / "release.rar")
+            touch(root / "upload" / "Other" / "other.rar")
+            touch(root / "upload" / "Other" / "disc.iso")
+            scan = cleaner.scan_rar_sets(root, (root / "upload",))
+            self.assertEqual(
+                [a.first_volume for a in scan.archive_sets],
+                [root / "Release" / "release.rar"],
+            )
+            self.assertEqual(cleaner.scan_iso_files(root, (root / "upload",)), ())
+
+    def test_iso_copy_keeps_iso_and_torrent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            image = touch(root / "torrents" / "Release" / "disc.iso", b"iso")
+            output = root / "upload"
+            output.mkdir()
+            torrent = self.make_torrent(root)
+            component = cleaner.IsoComponent(
+                (cleaner.IsoImage(image, frozenset({torrent.hash})),),
+                frozenset({torrent.hash}),
+            )
+            events = []
+            mounter = FakeIsoMounter({"disc.iso": {"BDMV/index.bdmv": b"index"}}, events)
+            client = FakeIsoMutationClient(torrent, events)
+
+            success, message = cleaner.process_iso_component(
+                component,
+                {torrent.hash: torrent},
+                client,
+                mounter,
+                root / "torrents",
+                root / "work",
+                0,
+                (os.getuid(), os.getgid()),
+                {image: output / "Release"},
+                output,
+            )
+
+            self.assertTrue(success, message)
+            self.assertTrue(image.exists())
+            self.assertEqual(
+                (output / "Release" / "BDMV" / "index.bdmv").read_bytes(), b"index"
+            )
+            self.assertNotIn("stop", events)
+            self.assertNotIn("remove-list-only", events)
+
+
 if __name__ == "__main__":
     unittest.main()

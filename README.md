@@ -16,6 +16,31 @@ próbálja kitalálni, hogy egy torrent RAR-os vagy ISO-s.
 > program kötelezően deleteFiles=false értéket küld. A RAR- és ISO-fájlokat
 > kizárólag maga a Python-program törli, és csak a sikeres feldolgozás után.
 
+## Másolatos mód (output_root)
+
+Ha a konfigurációban szerepel az `output_root` mező (például
+`"output_root": "/home/accofil/storage/upload"`), a program **nem a helyén
+bont ki**, hanem másolatot készít:
+
+- a RAR/ISO tartalma az `output_root/<eredeti release-mappanév>/` alá kerül,
+  átnevezés nélkül, az archívumon belüli almappákkal együtt (pl. `Subs/`);
+- csak az archívum/ISO tartalma kerül át, az `.nfo`, `.sfv`, `Sample/` és
+  egyéb kísérőfájlok nem;
+- az eredeti RAR-kötetek és ISO-k, valamint a qBittorrent-torrentek
+  **érintetlenek maradnak, és tovább seedelnek** (nincs leállítás, nincs
+  listából törlés);
+- ha a célmappa már létezik, a release-t kihagyja (`már kicsomagolva`),
+  így a parancs bármikor újra futtatható;
+- az `output_root` alatti fájlokat a forrásoldali keresés kihagyja. Az ISO-mód
+  viszont az `output_root` alatt talált, torrenthez nem tartozó ISO-kat (pl. egy
+  RAR-ból kibontott ISO-t) a helyükön bontja ki, mert azok már a saját másolataink;
+- forrásoldali, torrenthez nem tartozó ISO-hoz másolatos módban nem nyúl.
+
+Több scan root is használható ugyanazzal a kimenettel: készíts második
+konfigurációt más `scan_root` értékkel, és add meg `--config` kapcsolóval
+(`qbit-rar-cleaner --config ~/.config/qbit-rar-cleaner/config-nvme.json`).
+A telepítő újrafuttatáskor megtartja a meglévő `output_root` beállítást.
+
 ## A két mód közötti legfontosabb különbség
 
 A RAR- és az ISO-feldolgozást szándékosan nem lehet egyetlen menetben

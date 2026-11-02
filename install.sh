@@ -275,6 +275,15 @@ if len(values) != 12:
 ) = (
     value.decode("utf-8") for value in values
 )
+# A kézzel beállított output_root (másolatos mód) újratelepítéskor is megmarad.
+extra = {}
+try:
+    with open(sys.argv[2], encoding="utf-8") as previous:
+        old_output_root = json.load(previous).get("output_root")
+    if old_output_root:
+        extra["output_root"] = old_output_root
+except (OSError, ValueError):
+    pass
 with open(target, "w", encoding="utf-8") as handle:
     json.dump(
         {
@@ -292,13 +301,14 @@ with open(target, "w", encoding="utf-8") as handle:
             "log_dir": log_dir,
             "protected_tracker_domains": ["aither.cc"],
             "min_free_bytes": 1073741824,
+            **extra,
         },
         handle,
         ensure_ascii=False,
         indent=2,
     )
     handle.write("\n")
-' "$temp_config"
+' "$temp_config" "$config_file"
 chown "$service_user:$service_group" "$temp_config"
 chmod 0600 "$temp_config"
 mv -f -- "$temp_config" "$config_file"

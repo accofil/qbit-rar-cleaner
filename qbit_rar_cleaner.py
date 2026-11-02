@@ -4,6 +4,10 @@
 The filesystem is authoritative for discovery. qBittorrent is used only to
 prove exact file ownership, stop matching torrents, and remove their list
 entries with deleteFiles=false. RAR and ISO processing are separate modes.
+
+With ``output_root`` configured the tool runs in copy mode: archive/ISO
+contents go to ``output_root/<release folder name>/`` and the originals and
+their torrents are never touched, so they keep seeding.
 """
 
 from __future__ import annotations
@@ -262,12 +266,16 @@ def resolve_existing_file(path: Path, root: Path) -> Path:
     return resolved
 
 
-def filter_scanned_directories(current: Path, names: list[str]) -> None:
+def filter_scanned_directories(
+    current: Path, names: list[str], excluded: Iterable[Path] = ()
+) -> None:
+    excluded_paths = set(excluded)
     names[:] = [
         name
         for name in names
         if name not in {WORK_DIR_NAME, QUARANTINE_DIR_NAME}
         and not (current / name).is_symlink()
+        and (current / name) not in excluded_paths
     ]
 
 
@@ -284,9 +292,10 @@ def _volume_sort_key(path: Path) -> tuple[int, int, str]:
     return (99, 0, path.name.casefold())
 
 
-def scan_rar_sets(scan_root: Path) -> ScanResult:
+def scan_rar_sets(scan_root: Path, excluded: Iterable[Path] = ()) -> ScanResult:
     """Discover RAR sets from the real filesystem, never from torrent names."""
     by_directory: dict[Path, list[Path]] = defaultdict(list)
+    excluded = tuple(excluded)
 
     def walk_error(error: OSError) -> None:
         raise CleanerError(f"A könyvtárfa nem olvasható teljesen: {error}")
@@ -295,7 +304,7 @@ def scan_rar_sets(scan_root: Path) -> ScanResult:
         scan_root, followlinks=False, onerror=walk_error
     ):
         current = Path(dir_path)
-        filter_scanned_directories(current, dir_names)
+        filter_scanned_directories(current, dir_names, excluded)
         for file_name in file_names:
             if not RARISH_RE.search(file_name):
                 continue
@@ -363,9 +372,10 @@ def scan_rar_sets(scan_root: Path) -> ScanResult:
     )
 
 
-def scan_iso_files(scan_root: Path) -> tuple[Path, ...]:
+def scan_iso_files(scan_root: Path, excluded: Iterable[Path] = ()) -> tuple[Path, ...]:
     """Discover real, non-symlink ISO files recursively from the filesystem."""
     images: list[Path] = []
+    excluded = tuple(excluded)
 
     def walk_error(error: OSError) -> None:
         raise CleanerError(f"A könyvtárfa nem olvasható teljesen: {error}")
@@ -374,7 +384,7 @@ def scan_iso_files(scan_root: Path) -> tuple[Path, ...]:
         scan_root, followlinks=False, onerror=walk_error
     ):
         current = Path(dir_path)
-        filter_scanned_directories(current, dir_names)
+        filter_scanned_directories(current, dir_names, excluded)
         for file_name in file_names:
             if Path(file_name).suffix.casefold() != ".iso":
                 continue
@@ -1392,6 +1402,79 @@ def remove_empty_quarantine(quarantine_root: Path) -> None:
         pass
 
 
+def release_directory_for(
+    path: Path, owners: Iterable[str], torrent_by_hash: dict[str, Torrent]
+) -> Path:
+    """The torrent's own top folder when the file lies inside it, else its parent."""
+    for torrent_hash in sorted(owners):
+        torrent = torrent_by_hash[torrent_hash]
+        content = torrent.content_path.resolve(strict=False)
+        if (
+            content.is_dir()
+            and content != torrent.save_path.resolve(strict=False)
+            and is_within(path, content)
+        ):
+            return content
+    return path.parent
+
+
+def copy_destination(
+    path: Path,
+    owners: Iterable[str],
+    torrent_by_hash: dict[str, Torrent],
+    output_root: Path,
+) -> tuple[Path, Path]:
+    """Return (output release folder, destination of the file's own folder)."""
+    release = release_directory_for(path, owners, torrent_by_hash)
+    output_release = output_root / release.name
+    relative = path.parent.relative_to(release)
+    return output_release, output_release / relative
+
+
+def create_destination_bases(
+    bases: Iterable[Path], output_root: Path, owner: tuple[int, int] | None = None
+) -> list[Path]:
+    created: list[Path] = []
+    try:
+        for base in sorted(set(bases), key=lambda item: len(item.parts)):
+            if not is_within(base, output_root) or base == output_root:
+                raise ArchiveError(f"A kimeneti cél kilóg az output_root alól: {base}")
+            chain = [base, *base.parents[: len(base.relative_to(output_root).parts) - 1]]
+            for directory in reversed(chain):
+                if os.path.lexists(directory):
+                    if directory.is_symlink() or not directory.is_dir():
+                        raise ArchiveError(f"Nem létrehozható célkönyvtár: {directory}")
+                    continue
+                directory.mkdir(mode=0o755)
+                if owner is not None:
+                    os.chown(directory, owner[0], owner[1])
+                created.append(directory)
+    except Exception:
+        remove_created_directories(created)
+        raise
+    return created
+
+
+def remove_created_directories(created: Sequence[Path]) -> None:
+    for directory in sorted(created, key=lambda path: len(path.parts), reverse=True):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+
+def copy_mode_already_done(
+    paths_with_owners: Iterable[tuple[Path, Iterable[str]]],
+    torrent_by_hash: dict[str, Torrent],
+    output_root: Path,
+) -> Path | None:
+    for path, owners in paths_with_owners:
+        output_release, _ = copy_destination(path, owners, torrent_by_hash, output_root)
+        if os.path.lexists(output_release):
+            return output_release
+    return None
+
+
 def process_component(
     component: Component,
     torrent_by_hash: dict[str, Torrent],
@@ -1400,7 +1483,15 @@ def process_component(
     scan_root: Path,
     work_root: Path,
     min_free_bytes: int,
+    destinations: dict[Path, Path] | None = None,
+    output_root: Path | None = None,
 ) -> tuple[bool, str]:
+    # destinations (first volume -> output folder) switches on copy mode: the
+    # RAR volumes and the torrent are left alone and keep seeding.
+    copy_mode = destinations is not None
+    if copy_mode and output_root is None:
+        raise CleanerError("Másolatos módhoz output_root kell")
+    target_root = output_root if copy_mode else scan_root
     work_root.mkdir(parents=True, mode=0o700, exist_ok=True)
     transaction_id = f"txn-{uuid.uuid4().hex}"
     transaction = work_root / transaction_id
@@ -1408,15 +1499,16 @@ def process_component(
     links_root = work_root / f"{transaction_id}-links"
     quarantine_root = scan_root / QUARANTINE_DIR_NAME / transaction_id
     hashes = sorted(component.torrent_hashes)
-    originally_running = [
+    originally_running = [] if copy_mode else [
         torrent_hash
         for torrent_hash in hashes
         if torrent_by_hash[torrent_hash].state not in STOPPED_STATES
     ]
     quarantine_moves: list[tuple[Path, Path]] = []
+    created_bases: list[Path] = []
     removed_from_qbit = False
     log_event(
-        f"RAR TRANZAKCIÓ {transaction_id} indul; torrentek: "
+        f"RAR TRANZAKCIÓ {transaction_id} indul ({'másolat' if copy_mode else 'helyben'}); torrentek: "
         + "; ".join(f"{h} {torrent_by_hash[h].name}" for h in hashes)
         + "; archívumok: "
         + "; ".join(str(a.first_volume) for a in component.archive_sets),
@@ -1434,14 +1526,14 @@ def process_component(
             entries_by_set.append((archive_set, entries))
 
         work_free_bytes = shutil.disk_usage(work_root).free
-        storage_free_bytes = shutil.disk_usage(scan_root).free
+        storage_free_bytes = shutil.disk_usage(target_root).free
         if work_free_bytes - expected_bytes < min_free_bytes:
             raise ArchiveError(
                 "Nincs elég hely a munkakönyvtárban a kicsomagoláshoz: "
                 f"szükséges={expected_bytes}, szabad={work_free_bytes}, "
                 f"tartalék={min_free_bytes}"
             )
-        if work_root.stat().st_dev != scan_root.stat().st_dev and (
+        if work_root.stat().st_dev != target_root.stat().st_dev and (
             storage_free_bytes - expected_bytes < min_free_bytes
         ):
             raise ArchiveError(
@@ -1456,7 +1548,19 @@ def process_component(
             stage = extract_root / str(index)
             with openable_first_volume(archive_set, links_root) as openable:
                 extractor.extract(openable, stage)
-            stages.append((stage, archive_set.first_volume.parent))
+            if copy_mode:
+                stages.append((stage, destinations[archive_set.first_volume]))
+            else:
+                stages.append((stage, archive_set.first_volume.parent))
+
+        if copy_mode:
+            created_bases = create_destination_bases(destinations.values(), output_root)
+            merge_staged_tree(stages, output_root)
+            shutil.rmtree(transaction, ignore_errors=True)
+            names = ", ".join(torrent_by_hash[item].name for item in hashes)
+            targets = ", ".join(sorted({str(path) for path in destinations.values()}))
+            log_event(f"MÁSOLAT KÉSZ: {targets} (az eredeti seedel tovább)", action=True)
+            return True, f"SIKER (másolat, az eredeti seedel tovább): {names} -> {targets}"
 
         merge_staged_tree(stages, scan_root)
 
@@ -1498,6 +1602,7 @@ def process_component(
             + traceback.format_exc(),
             action=True,
         )
+        remove_created_directories(created_bases)
         if not removed_from_qbit:
             restore_quarantine(quarantine_moves)
             remove_empty_quarantine(quarantine_root)
@@ -1533,7 +1638,16 @@ def process_iso_component(
     work_root: Path,
     min_free_bytes: int,
     output_owner: tuple[int, int],
+    destinations: dict[Path, Path] | None = None,
+    output_root: Path | None = None,
 ) -> tuple[bool, str]:
+    # destinations (ISO -> output folder) switches on copy mode: the ISO and
+    # its torrent are left alone and keep seeding.
+    copy_mode = destinations is not None
+    if copy_mode and output_root is None:
+        raise CleanerError("Másolatos módhoz output_root kell")
+    target_root = output_root if copy_mode else scan_root
+    created_bases: list[Path] = []
     work_root.mkdir(parents=True, mode=0o700, exist_ok=True)
     transaction_id = f"iso-{uuid.uuid4().hex}"
     transaction = work_root / transaction_id
@@ -1543,7 +1657,7 @@ def process_iso_component(
     replacement_root = quarantine_root / "replaced-bdmv"
     iso_quarantine_root = quarantine_root / "iso-files"
     hashes = sorted(component.torrent_hashes)
-    originally_running = [
+    originally_running = [] if copy_mode else [
         torrent_hash
         for torrent_hash in hashes
         if torrent_by_hash[torrent_hash].state not in STOPPED_STATES
@@ -1554,7 +1668,7 @@ def process_iso_component(
     completed = False
     unmount_failed = False
     log_event(
-        f"ISO TRANZAKCIÓ {transaction_id} indul; ISO-k: "
+        f"ISO TRANZAKCIÓ {transaction_id} indul ({'másolat' if copy_mode else 'helyben'}); ISO-k: "
         + "; ".join(str(i.path) for i in component.images)
         + "; torrentek: "
         + ("; ".join(f"{h} {torrent_by_hash[h].name}" for h in hashes) or "nincs"),
@@ -1569,7 +1683,10 @@ def process_iso_component(
 
         for index, image in enumerate(component.images):
             image_path = resolve_existing_file(image.path, scan_root)
-            existing_bdmv, replace_bdmv = bdmv_structure_state(image_path.parent)
+            if copy_mode:
+                existing_bdmv, replace_bdmv = None, ()
+            else:
+                existing_bdmv, replace_bdmv = bdmv_structure_state(image_path.parent)
             if existing_bdmv is not None:
                 log_event(
                     f"ISO másolás kihagyva (teljes BDMV már megvan): {existing_bdmv}",
@@ -1600,8 +1717,8 @@ def process_iso_component(
                         f"szükséges={image_content_bytes}, "
                         f"szabad={work_free_bytes}, tartalék={min_free_bytes}"
                     )
-                if work_root.stat().st_dev != scan_root.stat().st_dev:
-                    storage_free_bytes = shutil.disk_usage(scan_root).free
+                if work_root.stat().st_dev != target_root.stat().st_dev:
+                    storage_free_bytes = shutil.disk_usage(target_root).free
                     if storage_free_bytes - expected_on_storage < min_free_bytes:
                         raise IsoError(
                             "Nincs elég hely a storage-on az ISO tartalmához: "
@@ -1609,7 +1726,9 @@ def process_iso_component(
                             f"szabad={storage_free_bytes}, tartalék={min_free_bytes}"
                         )
                 copy_mounted_entries(entries, stage)
-                stages.append((stage, image_path.parent))
+                stages.append(
+                    (stage, destinations[image.path] if copy_mode else image_path.parent)
+                )
             except BaseException as exc:  # noqa: BLE001 - unmount must still happen
                 operation_error = exc
 
@@ -1632,6 +1751,20 @@ def process_iso_component(
                         f"nem tartalmaz teljes gyökérszintű BDMV-struktúrát: {image_path}"
                     )
                 bdmv_to_replace.update(replace_bdmv)
+
+        if copy_mode:
+            created_bases = create_destination_bases(
+                destinations.values(), output_root, output_owner
+            )
+            merge_staged_tree(stages, output_root, output_owner)
+            shutil.rmtree(transaction, ignore_errors=True)
+            completed = True
+            image_names = ", ".join(str(image.path) for image in component.images)
+            targets = ", ".join(sorted({str(path) for path in destinations.values()}))
+            log_event(f"MÁSOLAT KÉSZ: {targets} (az eredeti seedel tovább)", action=True)
+            return True, (
+                f"SIKER (másolat, az eredeti seedel tovább): {image_names} -> {targets}"
+            )
 
         for bdmv_path in sorted(bdmv_to_replace):
             if not os.path.lexists(bdmv_path):
@@ -1704,6 +1837,7 @@ def process_iso_component(
             + traceback.format_exc(),
             action=True,
         )
+        remove_created_directories(created_bases)
         if not removed_from_qbit:
             restore_quarantine(iso_quarantine_moves)
             restore_quarantine(replacement_moves)
@@ -1773,7 +1907,13 @@ def print_plan(
     components: Sequence[Component],
     torrent_by_hash: dict[str, Torrent],
     blocked_hashes: Iterable[str],
+    copy_targets: dict[Path, Path] | None = None,
 ) -> None:
+    qbit_label = (
+        "qBittorrent (érintetlen, seedel tovább)"
+        if copy_targets is not None
+        else "qBittorrent (csak lista)"
+    )
     print(f"Lemezen talált RAR-készletek: {len(scan.archive_sets)}")
     print(f"Árva/hiányos RAR-kötetek: {len(scan.orphan_volumes)}")
     print(f"Pontosan qBittorrenthez egyeztetett feldolgozási egységek: {len(components)}")
@@ -1785,8 +1925,10 @@ def print_plan(
               f"{len(volumes)} RAR-kötet, {gib(sum(path.stat().st_size for path in volumes))}")
         for archive_set in component.archive_sets:
             print(f"  RAR: {archive_set.first_volume}")
+            if copy_targets is not None:
+                print(f"  Cél: {copy_targets[archive_set.first_volume]}")
         for torrent_hash in sorted(component.torrent_hashes):
-            print(f"  qBittorrent (csak lista): {torrent_by_hash[torrent_hash].name}")
+            print(f"  {qbit_label}: {torrent_by_hash[torrent_hash].name}")
     blocked = list(blocked_hashes)
     if blocked:
         print("\nKihagyott torrent (hiányos/árva, nem 100%-os vagy védett tracker):")
@@ -1801,7 +1943,13 @@ def print_iso_plan(
     torrent_by_hash: dict[str, Torrent],
     blocked_hashes: Iterable[str],
     blocked_paths: Sequence[Path],
+    copy_targets: dict[Path, Path] | None = None,
 ) -> None:
+    qbit_label = (
+        "qBittorrent (érintetlen, seedel tovább)"
+        if copy_targets is not None
+        else "qBittorrent (csak lista)"
+    )
     print(f"Lemezen talált ISO-fájlok: {len(disk_images)}")
     print(f"Biztonságosan feldolgozható ISO-egységek: {len(components)}")
     for index, component in enumerate(components, 1):
@@ -1811,6 +1959,8 @@ def print_iso_plan(
         )
         for image in component.images:
             print(f"  ISO: {image.path}")
+            if copy_targets and image.path in copy_targets:
+                print(f"  Cél: {copy_targets[image.path]}")
             if image.existing_bdmv is not None:
                 print(
                     "  Meglévő teljes BDMV: "
@@ -1823,10 +1973,7 @@ def print_iso_plan(
                 )
         if component.torrent_hashes:
             for torrent_hash in sorted(component.torrent_hashes):
-                print(
-                    "  qBittorrent (csak lista): "
-                    f"{torrent_by_hash[torrent_hash].name}"
-                )
+                print(f"  {qbit_label}: {torrent_by_hash[torrent_hash].name}")
         else:
             print("  qBittorrent: nincs listaelem; az ISO ettől még feldolgozható")
 
@@ -1870,6 +2017,44 @@ def protected_domains_from_config(config: dict[str, object]) -> tuple[str, ...]:
     return tuple(item.strip().casefold() for item in raw)
 
 
+def plan_copy_targets(
+    groups: Sequence[tuple[object, Sequence[tuple[Path, Iterable[str]]]]],
+    torrent_by_hash: dict[str, Torrent],
+    output_root: Path,
+) -> tuple[list[object], dict[Path, Path], list[tuple[object, Path, str]]]:
+    """Split components into (todo, file -> destination, skipped with reason)."""
+    todo: list[object] = []
+    targets: dict[Path, Path] = {}
+    skipped: list[tuple[object, Path, str]] = []
+    claimed: set[Path] = set()
+    for component, members in groups:
+        releases = {
+            path: copy_destination(path, owners, torrent_by_hash, output_root)
+            for path, owners in members
+        }
+        existing = sorted(
+            release for release, _ in releases.values() if os.path.lexists(release)
+        )
+        if existing:
+            skipped.append((component, existing[0], "már kicsomagolva"))
+            continue
+        clash = sorted(release for release, _ in releases.values() if release in claimed)
+        if clash:
+            skipped.append((component, clash[0], "ugyanez a célmappa egy másik tételé"))
+            continue
+        claimed.update(release for release, _ in releases.values())
+        targets.update({path: destination for path, (_, destination) in releases.items()})
+        todo.append(component)
+    return todo, targets, skipped
+
+
+def print_copy_skips(skipped: Sequence[tuple[object, Path, str]]) -> None:
+    if skipped:
+        print("\nKihagyva, a célmappa már létezik:")
+        for _, release, reason in skipped:
+            print(f"  {release} ({reason})")
+
+
 def run_rar_mode(
     args: argparse.Namespace,
     config: dict[str, object],
@@ -1877,6 +2062,7 @@ def run_rar_mode(
     scan_root: Path,
     work_root: Path,
     protected_domains: Sequence[str],
+    output_root: Path | None = None,
 ) -> int:
     if not config.get("seven_zip"):
         raise CleanerError(
@@ -1886,13 +2072,27 @@ def run_rar_mode(
         )
 
     # Discovery order is deliberate: disk first, qBittorrent second.
-    scan = scan_rar_sets(scan_root)
+    scan = scan_rar_sets(scan_root, (output_root,) if output_root else ())
     torrents = client.torrents()
     matched_sets, blocked_hashes, torrent_by_hash = cross_reference(
         scan, torrents, client, scan_root, protected_domains
     )
     components = build_components(matched_sets)
-    print_plan(scan, components, torrent_by_hash, blocked_hashes)
+    copy_targets: dict[Path, Path] | None = None
+    skipped: list[tuple[object, Path, str]] = []
+    if output_root is not None:
+        print(f"Másolatos mód: kimenet {output_root}/<release>, az eredeti seedel tovább")
+        todo, copy_targets, skipped = plan_copy_targets(
+            [
+                (component, [(a.first_volume, a.owners) for a in component.archive_sets])
+                for component in components
+            ],
+            torrent_by_hash,
+            output_root,
+        )
+        components = tuple(todo)
+    print_plan(scan, components, torrent_by_hash, blocked_hashes, copy_targets)
+    print_copy_skips(skipped)
 
     if not components:
         print("\nNincs biztonságosan feldolgozható, torrenthez egyeztetett RAR release.")
@@ -1902,9 +2102,12 @@ def run_rar_mode(
         print("Valódi RAR-futás: qbit-rar-cleaner --apply")
         return 0
     if not args.yes:
-        answer = input(
-            "\nÍrd be pontosan, hogy FELDOLGOZOM a RAR-kibontás és törlés indításához: "
+        action = (
+            "a kicsomagolt másolat elkészítéséhez"
+            if output_root is not None
+            else "a RAR-kibontás és törlés indításához"
         )
+        answer = input(f"\nÍrd be pontosan, hogy FELDOLGOZOM {action}: ")
         if answer != "FELDOLGOZOM":
             print("Megszakítva; nem történt módosítás.")
             return 2
@@ -1922,6 +2125,10 @@ def run_rar_mode(
             scan_root,
             work_root,
             min_free_bytes,
+            None
+            if copy_targets is None
+            else {a.first_volume: copy_targets[a.first_volume] for a in component.archive_sets},
+            output_root,
         )
         print(message)
         log_event(f"EREDMÉNY {index}/{len(components)}: {message}", action=True)
@@ -1936,6 +2143,7 @@ def run_iso_mode(
     scan_root: Path,
     work_root: Path,
     protected_domains: Sequence[str],
+    output_root: Path | None = None,
 ) -> int:
     if os.geteuid() != 0:
         raise CleanerError("Az ISO mountolásához ezt rootként futtasd: sudo qbit-iso-cleaner")
@@ -1947,17 +2155,72 @@ def run_iso_mode(
             + ", ".join(missing)
         )
 
-    disk_images = scan_iso_files(scan_root)
+    disk_images = scan_iso_files(scan_root, (output_root,) if output_root else ())
     torrents = client.torrents()
     matched_images, blocked_hashes, blocked_paths, torrent_by_hash = (
         cross_reference_isos(
             disk_images, torrents, client, scan_root, protected_domains
         )
     )
-    components = build_iso_components(matched_images)
+    copy_targets: dict[Path, Path] | None = None
+    skipped: list[tuple[object, Path, str]] = []
+    untouched: list[Path] = []
+    # (component, root it is processed under, destinations or None)
+    work: list[tuple[IsoComponent, Path, dict[Path, Path] | None]]
+    if output_root is None:
+        work = [
+            (component, scan_root, None)
+            for component in build_iso_components(matched_images)
+        ]
+    else:
+        print(f"Másolatos mód: kimenet {output_root}/<release>, az eredeti seedel tovább")
+        untouched = sorted(image.path for image in matched_images if not image.owners)
+        owned = build_iso_components([image for image in matched_images if image.owners])
+        todo, copy_targets, skipped = plan_copy_targets(
+            [
+                (component, [(image.path, image.owners) for image in component.images])
+                for component in owned
+            ],
+            torrent_by_hash,
+            output_root,
+        )
+        work = [
+            (
+                component,
+                scan_root,
+                {image.path: copy_targets[image.path] for image in component.images},
+            )
+            for component in todo
+        ]
+        # ISOs inside output_root are our own copies (e.g. unpacked from a RAR):
+        # they are expanded in place there, unless a torrent owns them.
+        own_images = scan_iso_files(output_root)
+        own_matched, own_blocked, own_blocked_paths, _ = cross_reference_isos(
+            own_images, torrents, client, output_root, protected_domains
+        )
+        work.extend(
+            (component, output_root, None)
+            for component in build_iso_components(
+                [image for image in own_matched if not image.owners]
+            )
+        )
+        blocked_hashes = frozenset(blocked_hashes | own_blocked)
+        blocked_paths = tuple(sorted({*blocked_paths, *own_blocked_paths}))
+        disk_images = (*disk_images, *own_images)
+    components = tuple(component for component, _, _ in work)
     print_iso_plan(
-        disk_images, components, torrent_by_hash, blocked_hashes, blocked_paths
+        disk_images,
+        components,
+        torrent_by_hash,
+        blocked_hashes,
+        blocked_paths,
+        copy_targets,
     )
+    print_copy_skips(skipped)
+    if untouched:
+        print("\nqBittorrent-listaelem nélküli ISO-k a forrásoldalon (érintetlenül hagyva):")
+        for path in untouched:
+            print(f"  {path}")
 
     if not components:
         print("\nNincs biztonságosan feldolgozható ISO-fájl.")
@@ -1967,9 +2230,12 @@ def run_iso_mode(
         print("Valódi ISO-futás: sudo qbit-iso-cleaner --apply")
         return 0
     if not args.yes:
-        answer = input(
-            "\nÍrd be pontosan, hogy ISO_FELDOLGOZOM a mountolás, másolás és törlés indításához: "
+        action = (
+            "a mountolás és a kicsomagolt másolat elkészítéséhez"
+            if output_root is not None
+            else "a mountolás, másolás és törlés indításához"
         )
+        answer = input(f"\nÍrd be pontosan, hogy ISO_FELDOLGOZOM {action}: ")
         if answer != "ISO_FELDOLGOZOM":
             print("Megszakítva; nem történt módosítás.")
             return 2
@@ -1980,20 +2246,22 @@ def run_iso_mode(
     output_owner = (int(config["service_uid"]), int(config["service_gid"]))
     min_free_bytes = int(config.get("min_free_bytes", 1024 ** 3))
     failures = 0
-    for index, component in enumerate(components, 1):
-        print(f"\nISO-feldolgozás {index}/{len(components)}...")
+    for index, (component, component_root, destinations) in enumerate(work, 1):
+        print(f"\nISO-feldolgozás {index}/{len(work)}...")
         success, message = process_iso_component(
             component,
             torrent_by_hash,
             client,
             mounter,
-            scan_root,
+            component_root,
             work_root,
             min_free_bytes,
             output_owner,
+            destinations,
+            output_root,
         )
         print(message)
-        log_event(f"EREDMÉNY {index}/{len(components)}: {message}", action=True)
+        log_event(f"EREDMÉNY {index}/{len(work)}: {message}", action=True)
         failures += 0 if success else 1
     return 1 if failures else 0
 
@@ -2028,6 +2296,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         ):
             raise CleanerError(f"A munkakönyvtár nem használható: {work_root}")
 
+        output_root: Path | None = None
+        if config.get("output_root"):
+            output_root = Path(str(config["output_root"])).expanduser()
+            if not output_root.is_dir():
+                raise CleanerError(f"Az output_root nem létező könyvtár: {output_root}")
+            output_root = output_root.resolve(strict=True)
+            if is_within(scan_root, output_root):
+                raise CleanerError("Az output_root nem lehet a scan root vagy annak szülője")
+
         setup_logging(config, mode, args)
         lock_handle = acquire_lock(work_root / ".operation.lock")
         client = QbitClient(
@@ -2046,6 +2323,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             scan_root,
             work_root,
             protected_domains,
+            output_root,
         )
         log_event(f"VÉGE kilépési kód={exit_code}", action=True)
         return exit_code

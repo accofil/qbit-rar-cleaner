@@ -13,5 +13,6 @@
   "protected_tracker_domains": [
     "aither.cc"
   ],
-  "min_free_bytes": 1073741824
+  "min_free_bytes": 1073741824,
+  "output_root": "/home/accofil/storage/upload"
 }
