@@ -51,6 +51,23 @@ munkamenetnév esetén új munkamenetet nyit `-2`, `-3`, ... utótaggal
 (`tmux ls`, `tmux attach -t qbit-rar-cleaner-2`). A helyben kibontó (törlő)
 mód továbbra is csak egy példányban futhat.
 
+### Folyamatjelző
+
+Terminálban (tmux-ban is) a hosszú lépések egy helyben frissülő
+százaléksort mutatnak, becsült hátralévő idővel:
+
+```
+  Ellenőrzés cls-amade.rar:  42.0% | kb. 1:12 van hátra
+  Kibontás cls-amade.rar: 100.0% | kész (2:31)
+  ISO másolása AMADEUS.iso:  63.5% | 22.10 GiB / 34.80 GiB | kb. 0:48 van hátra
+  Áthelyezés a célmappába: 100.0% | 34.80 GiB / 34.80 GiB | kész (3:05)
+```
+
+Az ellenőrzés és a kibontás a 7-Zip saját százalékát mutatja, a másolás és
+a lemezek közötti áthelyezés bájtra pontos. Az azonnali (ugyanazon a lemezen
+történő) átnevezés nem ír sort. Ha a kimenet nem terminál (cron, log),
+a folyamatjelző néma.
+
 ## A két mód közötti legfontosabb különbség
 
 A RAR- és az ISO-feldolgozást szándékosan nem lehet egyetlen menetben

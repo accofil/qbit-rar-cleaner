@@ -25,6 +25,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import uuid
@@ -943,20 +944,89 @@ def openable_first_volume(archive_set: ArchiveSet, links_root: Path) -> Iterator
         shutil.rmtree(link_dir, ignore_errors=True)
 
 
+class Progress:
+    """One self-overwriting percentage line on the terminal (silent without a TTY)."""
+
+    def __init__(self, label: str, total: int = 0, enabled: bool | None = None):
+        self.label = label
+        self.total = max(int(total), 0)
+        self.done = 0
+        self.percent = 0.0
+        self.enabled = sys.stdout.isatty() if enabled is None else enabled
+        self.started = time.monotonic()
+        # Quick steps (e.g. a same-disk rename) never draw anything.
+        self._last_draw = self.started
+        self._width = 0
+
+    def advance(self, amount: int) -> None:
+        self.done += amount
+        if self.total:
+            self.set_percent(100.0 * self.done / self.total)
+
+    def set_percent(self, percent: float) -> None:
+        self.percent = min(max(percent, 0.0), 100.0)
+        now = time.monotonic()
+        if now - self._last_draw >= 0.5:
+            self._last_draw = now
+            self._draw(now)
+
+    def _draw(self, now: float, suffix: str = "") -> None:
+        if not self.enabled:
+            return
+        elapsed = now - self.started
+        parts = [f"  {self.label}: {self.percent:5.1f}%"]
+        if self.total:
+            parts.append(f"{gib(min(self.done, self.total))} / {gib(self.total)}")
+        if 0 < self.percent < 100 and elapsed >= 2:
+            remaining = elapsed * (100 - self.percent) / self.percent
+            parts.append(f"kb. {format_duration(remaining)} van hátra")
+        line = " | ".join(parts) + suffix
+        sys.stdout.write("\r" + line.ljust(self._width))
+        sys.stdout.flush()
+        self._width = len(line)
+
+    def finish(self) -> None:
+        if not self.enabled or (
+            not self._width and time.monotonic() - self.started < 0.5
+        ):
+            return
+        self.percent = 100.0
+        self.done = max(self.done, self.total)
+        now = time.monotonic()
+        self._draw(now, f" | kész ({format_duration(now - self.started)})")
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
+def format_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    hours, rest = divmod(seconds, 3600)
+    minutes, seconds = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
+
+
+SEVEN_ZIP_PERCENT = re.compile(rb"(\d{1,3})%")
+
+
 class SevenZip:
     def __init__(self, executable: str):
         self.executable = executable
 
-    def _run(self, arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    def _run(
+        self, arguments: Sequence[str], progress_label: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
         env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
-        completed = subprocess.run(
-            [self.executable, *arguments],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=env,
-            check=False,
-        )
+        if progress_label is None:
+            completed = subprocess.run(
+                [self.executable, *arguments],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=env,
+                check=False,
+            )
+        else:
+            completed = self._run_with_progress(arguments, progress_label, env)
         log_event(
             f"7Z {' '.join(arguments)} -> exit={completed.returncode}", action=True
         )
@@ -968,8 +1038,46 @@ class SevenZip:
             )
         return completed
 
+    def _run_with_progress(
+        self, arguments: Sequence[str], label: str, env: dict[str, str]
+    ) -> subprocess.CompletedProcess[str]:
+        # -bsp2: percentages go to stderr only; -bse1: errors stay in stdout.
+        command = [self.executable, arguments[0], "-bsp2", "-bse1", *arguments[1:]]
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        output: list[bytes] = []
+        reader = threading.Thread(
+            target=lambda: output.append(process.stdout.read()), daemon=True
+        )
+        reader.start()
+        progress = Progress(label)
+        while True:
+            chunk = os.read(process.stderr.fileno(), 4096)
+            if not chunk:
+                break
+            found = SEVEN_ZIP_PERCENT.findall(chunk)
+            if found:
+                progress.set_percent(float(found[-1]))
+        returncode = process.wait()
+        reader.join()
+        process.stdout.close()
+        process.stderr.close()
+        if returncode == 0:
+            progress.finish()
+        elif progress.enabled:
+            sys.stdout.write("\n")
+        text = b"".join(output).decode("utf-8", errors="replace")
+        return subprocess.CompletedProcess(command, returncode, text, None)
+
     def test(self, first_volume: Path) -> None:
-        self._run(["t", "-y", "-bb0", "--", str(first_volume)])
+        self._run(
+            ["t", "-y", "-bb0", "--", str(first_volume)],
+            f"Ellenőrzés {first_volume.name}",
+        )
 
     def entries(self, first_volume: Path) -> tuple[ArchiveEntry, ...]:
         output = self._run(["l", "-slt", "--", str(first_volume)]).stdout
@@ -1015,7 +1123,8 @@ class SevenZip:
     def extract(self, first_volume: Path, destination: Path) -> None:
         destination.mkdir(parents=True, exist_ok=False)
         self._run(
-            ["x", "-y", "-aoa", "-bb0", f"-o{destination}", "--", str(first_volume)]
+            ["x", "-y", "-aoa", "-bb0", f"-o{destination}", "--", str(first_volume)],
+            f"Kibontás {first_volume.name}",
         )
 
 
@@ -1094,8 +1203,21 @@ def inspect_mounted_tree(mount_root: Path) -> tuple[MountedEntry, ...]:
     return tuple(entries)
 
 
-def copy_mounted_entries(entries: Sequence[MountedEntry], stage_root: Path) -> None:
+def copy_with_progress(source, target, progress: Progress | None) -> None:
+    while True:
+        chunk = source.read(8 * 1024 * 1024)
+        if not chunk:
+            return
+        target.write(chunk)
+        if progress is not None:
+            progress.advance(len(chunk))
+
+
+def copy_mounted_entries(
+    entries: Sequence[MountedEntry], stage_root: Path, label: str = "ISO másolása"
+) -> None:
     stage_root.mkdir(parents=True, exist_ok=False, mode=0o700)
+    progress = Progress(label, sum(entry.size for entry in entries))
     for entry in entries:
         destination = stage_root / entry.relative_path
         if entry.is_directory:
@@ -1103,12 +1225,13 @@ def copy_mounted_entries(entries: Sequence[MountedEntry], stage_root: Path) -> N
             continue
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
         with entry.source.open("rb") as source, destination.open("xb") as target:
-            shutil.copyfileobj(source, target, length=8 * 1024 * 1024)
+            copy_with_progress(source, target, progress)
             target.flush()
             os.fsync(target.fileno())
         os.chmod(destination, 0o644)
         if destination.stat().st_size != entry.size:
             raise IsoError(f"Az ISO-fájl másolási mérete eltér: {entry.relative_path}")
+    progress.finish()
 
 
 def sha256(path: Path) -> str:
@@ -1237,6 +1360,7 @@ def copy_file_atomic(
     source: Path,
     destination: Path,
     owner: tuple[int, int] | None = None,
+    progress: Progress | None = None,
 ) -> None:
     descriptor, temp_name = tempfile.mkstemp(
         prefix=f".{destination.name}.qbit-cleaner-", dir=destination.parent
@@ -1247,9 +1371,7 @@ def copy_file_atomic(
             descriptor, "wb"
         ) as target_handle:
             descriptor = -1
-            shutil.copyfileobj(
-                source_handle, target_handle, length=8 * 1024 * 1024
-            )
+            copy_with_progress(source_handle, target_handle, progress)
             target_handle.flush()
             os.fsync(target_handle.fileno())
             source_mode = stat.S_IMODE(source.stat().st_mode) & 0o777
@@ -1267,14 +1389,18 @@ def move_file_cross_device(
     source: Path,
     destination: Path,
     owner: tuple[int, int] | None = None,
+    progress: Progress | None = None,
 ) -> None:
     log_event(f"MOVE {source} -> {destination}")
+    size = source.stat().st_size if progress is not None else 0
     try:
         os.replace(source, destination)
+        if progress is not None:
+            progress.advance(size)
     except OSError as exc:
         if exc.errno != errno.EXDEV:
             raise
-        copy_file_atomic(source, destination, owner)
+        copy_file_atomic(source, destination, owner, progress)
         try:
             source.unlink()
         except Exception:
@@ -1317,6 +1443,9 @@ def merge_staged_files(
     owner: tuple[int, int] | None = None,
 ) -> None:
     moved: list[StagedFile] = []
+    progress = Progress(
+        "Áthelyezés a célmappába", sum(item.source.stat().st_size for item in staged)
+    )
     try:
         for item in staged:
             if item.destination.exists():
@@ -1329,10 +1458,12 @@ def merge_staged_files(
                 log_event(
                     f"SKIP (azonos tartalmú cél már létezik): {item.destination}"
                 )
+                progress.advance(item.source.stat().st_size)
                 item.source.unlink()
                 continue
-            move_file_cross_device(item.source, item.destination, owner)
+            move_file_cross_device(item.source, item.destination, owner, progress)
             moved.append(item)
+        progress.finish()
     except Exception:
         for item in reversed(moved):
             if item.destination.exists() and not item.source.exists():
@@ -1726,7 +1857,7 @@ def process_iso_component(
                             f"szükséges={expected_on_storage}, "
                             f"szabad={storage_free_bytes}, tartalék={min_free_bytes}"
                         )
-                copy_mounted_entries(entries, stage)
+                copy_mounted_entries(entries, stage, f"ISO másolása {image.path.name}")
                 stages.append(
                     (stage, destinations[image.path] if copy_mode else image_path.parent)
                 )

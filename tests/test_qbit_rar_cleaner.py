@@ -1396,5 +1396,37 @@ class MultiInstanceTests(unittest.TestCase):
         )
 
 
+class ProgressTests(unittest.TestCase):
+    def test_draws_percent_and_finishes_with_newline(self):
+        with mock.patch("sys.stdout") as stdout:
+            progress = cleaner.Progress("Teszt", total=200, enabled=True)
+            progress.started -= 10
+            progress._last_draw = 0.0
+            progress.advance(100)
+            progress.finish()
+        written = "".join(call.args[0] for call in stdout.write.call_args_list)
+        self.assertIn(" 50.0%", written)
+        self.assertIn("100.0%", written)
+        self.assertIn("kész", written)
+        self.assertTrue(written.endswith("\n"))
+
+    def test_quick_step_prints_nothing(self):
+        with mock.patch("sys.stdout") as stdout:
+            progress = cleaner.Progress("Gyors", total=10, enabled=True)
+            progress.advance(10)
+            progress.finish()
+        stdout.write.assert_not_called()
+
+    def test_disabled_without_tty(self):
+        with mock.patch("sys.stdout") as stdout:
+            stdout.isatty.return_value = False
+            progress = cleaner.Progress("Nincs TTY", total=10)
+            progress.started -= 10
+            progress._last_draw = 0.0
+            progress.advance(5)
+            progress.finish()
+        stdout.write.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
