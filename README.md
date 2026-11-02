@@ -41,6 +41,16 @@ konfigurációt más `scan_root` értékkel, és add meg `--config` kapcsolóval
 (`qbit-rar-cleaner --config ~/.config/qbit-rar-cleaner/config-nvme.json`).
 A telepítő újrafuttatáskor megtartja a meglévő `output_root` beállítást.
 
+Másolatos módban **több példány is futhat egyszerre** (RAR és ISO, egy vagy
+több konfigurációval). Nincs globális zár: minden release-hez külön zárfájl
+tartozik az `output_root/.qbit-rar-cleaner-locks/` alatt, így két példány soha
+nem dolgozik ugyanazon a release-en. A foglaltat a másik példány kihagyja
+(`KIHAGYVA: egy másik példány már dolgozik rajta`), ami pedig közben elkészült,
+azt is (`időközben egy másik példány elkészítette`). A tmux-wrapper foglalt
+munkamenetnév esetén új munkamenetet nyit `-2`, `-3`, ... utótaggal
+(`tmux ls`, `tmux attach -t qbit-rar-cleaner-2`). A helyben kibontó (törlő)
+mód továbbra is csak egy példányban futhat.
+
 ## A két mód közötti legfontosabb különbség
 
 A RAR- és az ISO-feldolgozást szándékosan nem lehet egyetlen menetben

@@ -45,6 +45,7 @@ RARISH_RE = re.compile(
 )
 WORK_DIR_NAME = ".qbit-rar-cleaner-work"
 QUARANTINE_DIR_NAME = ".qbit-rar-cleaner-quarantine"
+LOCK_DIR_NAME = ".qbit-rar-cleaner-locks"
 STOPPED_STATES = {"stoppedUP", "stoppedDL", "pausedUP", "pausedDL"}
 DEFAULT_PROTECTED_TRACKER_DOMAINS = ("aither.cc",)
 
@@ -273,7 +274,7 @@ def filter_scanned_directories(
     names[:] = [
         name
         for name in names
-        if name not in {WORK_DIR_NAME, QUARANTINE_DIR_NAME}
+        if name not in {WORK_DIR_NAME, QUARANTINE_DIR_NAME, LOCK_DIR_NAME}
         and not (current / name).is_symlink()
         and (current / name) not in excluded_paths
     ]
@@ -1898,6 +1899,46 @@ def acquire_lock(lock_path: Path) -> object:
     return handle
 
 
+@contextlib.contextmanager
+def item_locks(
+    lock_dir: Path, keys: Iterable[object], owner: tuple[int, int] | None = None
+) -> Iterator[bool]:
+    """Non-blocking per-release locks, so several instances can run at once.
+
+    Yields False when another instance already holds one of the keys.
+    """
+    if not lock_dir.exists():
+        lock_dir.mkdir(mode=0o755, exist_ok=True)
+        if owner is not None and os.geteuid() == 0:
+            os.chown(lock_dir, owner[0], owner[1])
+    handles: list[object] = []
+    acquired = True
+    try:
+        for key in sorted({str(item) for item in keys}):
+            digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:40]
+            flags = os.O_RDONLY | os.O_CREAT
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            # Read-only, world-readable: the root ISO mode and the user RAR
+            # mode must be able to lock the same file.
+            descriptor = os.open(lock_dir / f"{digest}.lock", flags, 0o644)
+            handle = os.fdopen(descriptor, "r")
+            handles.append(handle)
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                acquired = False
+                break
+        yield acquired
+    finally:
+        for handle in handles:
+            handle.close()
+
+
+def output_release_of(path: Path, output_root: Path) -> Path:
+    return output_root / path.relative_to(output_root).parts[0]
+
+
 def gib(value: int) -> str:
     return f"{value / (1024 ** 3):.2f} GiB"
 
@@ -2115,24 +2156,42 @@ def run_rar_mode(
     min_free_bytes = int(config.get("min_free_bytes", 1024 ** 3))
     extractor = SevenZip(str(config["seven_zip"]))
     failures = 0
+    lock_dir = (output_root or work_root) / LOCK_DIR_NAME
     for index, component in enumerate(components, 1):
         print(f"\nRAR-feldolgozás {index}/{len(components)}...")
-        success, message = process_component(
-            component,
-            torrent_by_hash,
-            client,
-            extractor,
-            scan_root,
-            work_root,
-            min_free_bytes,
+        destinations = (
             None
             if copy_targets is None
-            else {a.first_volume: copy_targets[a.first_volume] for a in component.archive_sets},
-            output_root,
+            else {a.first_volume: copy_targets[a.first_volume] for a in component.archive_sets}
         )
+        releases = (
+            {output_release_of(path, output_root) for path in destinations.values()}
+            if destinations is not None
+            else set()
+        )
+        keys = [*releases, *(a.first_volume for a in component.archive_sets)]
+        with item_locks(lock_dir, keys) as acquired:
+            if not acquired:
+                message = "KIHAGYVA: egy másik példány már dolgozik rajta"
+            elif any(os.path.lexists(release) for release in releases) or not all(
+                a.first_volume.exists() for a in component.archive_sets
+            ):
+                message = "KIHAGYVA: időközben egy másik példány elkészítette"
+            else:
+                success, message = process_component(
+                    component,
+                    torrent_by_hash,
+                    client,
+                    extractor,
+                    scan_root,
+                    work_root,
+                    min_free_bytes,
+                    destinations,
+                    output_root,
+                )
+                failures += 0 if success else 1
         print(message)
         log_event(f"EREDMÉNY {index}/{len(components)}: {message}", action=True)
-        failures += 0 if success else 1
     return 1 if failures else 0
 
 
@@ -2246,23 +2305,40 @@ def run_iso_mode(
     output_owner = (int(config["service_uid"]), int(config["service_gid"]))
     min_free_bytes = int(config.get("min_free_bytes", 1024 ** 3))
     failures = 0
+    lock_dir = (output_root or work_root) / LOCK_DIR_NAME
     for index, (component, component_root, destinations) in enumerate(work, 1):
         print(f"\nISO-feldolgozás {index}/{len(work)}...")
-        success, message = process_iso_component(
-            component,
-            torrent_by_hash,
-            client,
-            mounter,
-            component_root,
-            work_root,
-            min_free_bytes,
-            output_owner,
-            destinations,
-            output_root,
-        )
+        if output_root is None:
+            releases: set[Path] = set()
+        elif destinations is not None:
+            releases = {output_release_of(path, output_root) for path in destinations.values()}
+        else:
+            releases = {output_release_of(image.path, output_root) for image in component.images}
+        keys = [*releases, *(image.path for image in component.images)]
+        with item_locks(lock_dir, keys, output_owner) as acquired:
+            if not acquired:
+                message = "KIHAGYVA: egy másik példány már dolgozik rajta"
+            elif (
+                destinations is not None
+                and any(os.path.lexists(release) for release in releases)
+            ) or not all(image.path.exists() for image in component.images):
+                message = "KIHAGYVA: időközben egy másik példány elkészítette"
+            else:
+                success, message = process_iso_component(
+                    component,
+                    torrent_by_hash,
+                    client,
+                    mounter,
+                    component_root,
+                    work_root,
+                    min_free_bytes,
+                    output_owner,
+                    destinations,
+                    output_root,
+                )
+                failures += 0 if success else 1
         print(message)
         log_event(f"EREDMÉNY {index}/{len(work)}: {message}", action=True)
-        failures += 0 if success else 1
     return 1 if failures else 0
 
 
@@ -2306,7 +2382,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise CleanerError("Az output_root nem lehet a scan root vagy annak szülője")
 
         setup_logging(config, mode, args)
-        lock_handle = acquire_lock(work_root / ".operation.lock")
+        if output_root is None:
+            # In-place mode deletes originals: keep it strictly single-instance.
+            lock_handle = acquire_lock(work_root / ".operation.lock")
         client = QbitClient(
             str(config["qb_url"]),
             str(config["qb_username"]),

@@ -1371,5 +1371,30 @@ class CopyModeTests(unittest.TestCase):
             self.assertNotIn("remove-list-only", events)
 
 
+class MultiInstanceTests(unittest.TestCase):
+    def test_item_lock_is_exclusive_per_key(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            locks = Path(temporary) / "locks"
+            with cleaner.item_locks(locks, ["/upload/A", "/src/a.rar"]) as first:
+                self.assertTrue(first)
+                with cleaner.item_locks(locks, ["/upload/A"]) as second:
+                    self.assertFalse(second)
+                with cleaner.item_locks(locks, ["/upload/B"]) as other:
+                    self.assertTrue(other)
+            with cleaner.item_locks(locks, ["/upload/A"]) as again:
+                self.assertTrue(again)
+
+    def test_lock_dir_is_not_scanned(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            touch(root / cleaner.LOCK_DIR_NAME / "x.rar")
+            self.assertEqual(cleaner.scan_rar_sets(root).archive_sets, ())
+
+    def test_output_release_of(self):
+        self.assertEqual(
+            cleaner.output_release_of(Path("/up/Rel/Subs"), Path("/up")), Path("/up/Rel")
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -339,11 +339,18 @@ relaunch_in_tmux() {
   if [[ $(id -u) -eq 0 && -n ${TMUX_USER:-} ]]; then
     t=(runuser -u "$TMUX_USER" -- tmux)
   fi
-  if "${t[@]}" has-session -t "=$session" 2>/dev/null; then
-    echo "A(z) $session tmux-munkamenet már fut, csatlakozom (az új paramétereket nem veszi figyelembe)." >&2
-    exec "${t[@]}" attach-session -t "=$session"
+  # Több példány is futhat: foglalt név esetén -2, -3, ... utótagú új munkamenet.
+  local name=$session n=2
+  while "${t[@]}" has-session -t "=$name" 2>/dev/null; do
+    name="${session}-${n}"
+    n=$((n + 1))
+  done
+  if [[ $name != "$session" ]]; then
+    echo "Már fut $session munkamenet; új példány indul: $name" >&2
+    echo "Lista: tmux ls   Visszacsatlakozás: tmux attach -t NÉV" >&2
+    sleep 2
   fi
-  exec "${t[@]}" new-session -s "$session" -- bash -c \
+  exec "${t[@]}" new-session -s "$name" -- bash -c \
     'env QBIT_CLEANER_IN_TMUX=1 "$@"; rc=$?; echo; read -r -p "Kész (kilépési kód: $rc). Enter a munkamenet bezárásához..." _; exit "$rc"' \
     _ "$0" "$@"
 }
