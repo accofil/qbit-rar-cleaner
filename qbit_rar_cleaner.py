@@ -8,6 +8,9 @@ entries with deleteFiles=false. RAR and ISO processing are separate modes.
 With ``output_root`` configured the tool runs in copy mode: archive/ISO
 contents go to ``output_root/<release folder name>/`` and the originals and
 their torrents are never touched, so they keep seeding.
+
+With ``side_by_side`` the contents are unpacked next to the archive/ISO in its
+own folder, and again the originals and their torrents are left alone.
 """
 
 from __future__ import annotations
@@ -1595,6 +1598,20 @@ def remove_created_directories(created: Sequence[Path]) -> None:
             pass
 
 
+def already_unpacked(base: Path, entries: Iterable[object]) -> bool:
+    """True when every file of the archive/ISO already lies under base, same size."""
+    files = [entry for entry in entries if not entry.is_directory]
+    for entry in files:
+        target = base / entry.relative_path
+        try:
+            info = target.lstat()
+        except OSError:
+            return False
+        if not stat.S_ISREG(info.st_mode) or info.st_size != entry.size:
+            return False
+    return bool(files)
+
+
 def copy_mode_already_done(
     paths_with_owners: Iterable[tuple[Path, Iterable[str]]],
     torrent_by_hash: dict[str, Torrent],
@@ -1617,9 +1634,11 @@ def process_component(
     min_free_bytes: int,
     destinations: dict[Path, Path] | None = None,
     output_root: Path | None = None,
+    side_by_side: bool = False,
 ) -> tuple[bool, str]:
     # destinations (first volume -> output folder) switches on copy mode: the
     # RAR volumes and the torrent are left alone and keep seeding.
+    # side_by_side unpacks next to the volumes and also leaves them alone.
     copy_mode = destinations is not None
     if copy_mode and output_root is None:
         raise CleanerError("Másolatos módhoz output_root kell")
@@ -1631,7 +1650,7 @@ def process_component(
     links_root = work_root / f"{transaction_id}-links"
     quarantine_root = scan_root / QUARANTINE_DIR_NAME / transaction_id
     hashes = sorted(component.torrent_hashes)
-    originally_running = [] if copy_mode else [
+    originally_running = [] if copy_mode or side_by_side else [
         torrent_hash
         for torrent_hash in hashes
         if torrent_by_hash[torrent_hash].state not in STOPPED_STATES
@@ -1639,8 +1658,9 @@ def process_component(
     quarantine_moves: list[tuple[Path, Path]] = []
     created_bases: list[Path] = []
     removed_from_qbit = False
+    kind = "másolat" if copy_mode else "egymás mellé" if side_by_side else "helyben"
     log_event(
-        f"RAR TRANZAKCIÓ {transaction_id} indul ({'másolat' if copy_mode else 'helyben'}); torrentek: "
+        f"RAR TRANZAKCIÓ {transaction_id} indul ({kind}); torrentek: "
         + "; ".join(f"{h} {torrent_by_hash[h].name}" for h in hashes)
         + "; archívumok: "
         + "; ".join(str(a.first_volume) for a in component.archive_sets),
@@ -1650,6 +1670,15 @@ def process_component(
     try:
         expected_bytes = 0
         entries_by_set: list[tuple[ArchiveSet, tuple[ArchiveEntry, ...]]] = []
+        if side_by_side:
+            # The cheap listing first: a finished release is not tested again.
+            listed = []
+            for archive_set in component.archive_sets:
+                with openable_first_volume(archive_set, links_root) as openable:
+                    listed.append((archive_set, extractor.entries(openable)))
+            if all(already_unpacked(a.first_volume.parent, e) for a, e in listed):
+                names = ", ".join(torrent_by_hash[item].name for item in hashes)
+                return True, f"KIHAGYVA: már ki van bontva mellé: {names}"
         for archive_set in component.archive_sets:
             with openable_first_volume(archive_set, links_root) as openable:
                 extractor.test(openable)
@@ -1695,6 +1724,11 @@ def process_component(
             return True, f"SIKER (másolat, az eredeti seedel tovább): {names} -> {targets}"
 
         merge_staged_tree(stages, scan_root)
+        if side_by_side:
+            shutil.rmtree(transaction, ignore_errors=True)
+            names = ", ".join(torrent_by_hash[item].name for item in hashes)
+            log_event(f"EGYMÁS MELLÉ KÉSZ: {names} (a RAR-ok seedelnek tovább)", action=True)
+            return True, f"SIKER (a RAR-ok mellé, az eredeti seedel tovább): {names}"
 
         client.stop(hashes)
         wait_for_stopped(client, hashes)
@@ -1772,9 +1806,11 @@ def process_iso_component(
     output_owner: tuple[int, int],
     destinations: dict[Path, Path] | None = None,
     output_root: Path | None = None,
+    side_by_side: bool = False,
 ) -> tuple[bool, str]:
     # destinations (ISO -> output folder) switches on copy mode: the ISO and
     # its torrent are left alone and keep seeding.
+    # side_by_side copies the contents next to the ISO and also leaves it alone.
     copy_mode = destinations is not None
     if copy_mode and output_root is None:
         raise CleanerError("Másolatos módhoz output_root kell")
@@ -1789,7 +1825,7 @@ def process_iso_component(
     replacement_root = quarantine_root / "replaced-bdmv"
     iso_quarantine_root = quarantine_root / "iso-files"
     hashes = sorted(component.torrent_hashes)
-    originally_running = [] if copy_mode else [
+    originally_running = [] if copy_mode or side_by_side else [
         torrent_hash
         for torrent_hash in hashes
         if torrent_by_hash[torrent_hash].state not in STOPPED_STATES
@@ -1799,8 +1835,9 @@ def process_iso_component(
     removed_from_qbit = False
     completed = False
     unmount_failed = False
+    kind = "másolat" if copy_mode else "egymás mellé" if side_by_side else "helyben"
     log_event(
-        f"ISO TRANZAKCIÓ {transaction_id} indul ({'másolat' if copy_mode else 'helyben'}); ISO-k: "
+        f"ISO TRANZAKCIÓ {transaction_id} indul ({kind}); ISO-k: "
         + "; ".join(str(i.path) for i in component.images)
         + "; torrentek: "
         + ("; ".join(f"{h} {torrent_by_hash[h].name}" for h in hashes) or "nincs"),
@@ -1815,7 +1852,7 @@ def process_iso_component(
 
         for index, image in enumerate(component.images):
             image_path = resolve_existing_file(image.path, scan_root)
-            if copy_mode:
+            if copy_mode or side_by_side:
                 existing_bdmv, replace_bdmv = None, ()
             else:
                 existing_bdmv, replace_bdmv = bdmv_structure_state(image_path.parent)
@@ -1838,29 +1875,32 @@ def process_iso_component(
                 entries = inspect_mounted_tree(mount_point)
                 if not entries:
                     raise IsoError(f"Az ISO üres: {image_path}")
-                image_content_bytes = sum(
-                    entry.size for entry in entries if not entry.is_directory
-                )
-                expected_on_storage += image_content_bytes
-                work_free_bytes = shutil.disk_usage(work_root).free
-                if work_free_bytes - image_content_bytes < min_free_bytes:
-                    raise IsoError(
-                        "Nincs elég hely az ISO ideiglenes másolatához: "
-                        f"szükséges={image_content_bytes}, "
-                        f"szabad={work_free_bytes}, tartalék={min_free_bytes}"
+                if side_by_side and already_unpacked(image_path.parent, entries):
+                    print(f"  Már ki van bontva mellé: {image.path}")
+                else:
+                    image_content_bytes = sum(
+                        entry.size for entry in entries if not entry.is_directory
                     )
-                if work_root.stat().st_dev != target_root.stat().st_dev:
-                    storage_free_bytes = shutil.disk_usage(target_root).free
-                    if storage_free_bytes - expected_on_storage < min_free_bytes:
+                    expected_on_storage += image_content_bytes
+                    work_free_bytes = shutil.disk_usage(work_root).free
+                    if work_free_bytes - image_content_bytes < min_free_bytes:
                         raise IsoError(
-                            "Nincs elég hely a storage-on az ISO tartalmához: "
-                            f"szükséges={expected_on_storage}, "
-                            f"szabad={storage_free_bytes}, tartalék={min_free_bytes}"
+                            "Nincs elég hely az ISO ideiglenes másolatához: "
+                            f"szükséges={image_content_bytes}, "
+                            f"szabad={work_free_bytes}, tartalék={min_free_bytes}"
                         )
-                copy_mounted_entries(entries, stage, f"ISO másolása {image.path.name}")
-                stages.append(
-                    (stage, destinations[image.path] if copy_mode else image_path.parent)
-                )
+                    if work_root.stat().st_dev != target_root.stat().st_dev:
+                        storage_free_bytes = shutil.disk_usage(target_root).free
+                        if storage_free_bytes - expected_on_storage < min_free_bytes:
+                            raise IsoError(
+                                "Nincs elég hely a storage-on az ISO tartalmához: "
+                                f"szükséges={expected_on_storage}, "
+                                f"szabad={storage_free_bytes}, tartalék={min_free_bytes}"
+                            )
+                    copy_mounted_entries(entries, stage, f"ISO másolása {image.path.name}")
+                    stages.append(
+                        (stage, destinations[image.path] if copy_mode else image_path.parent)
+                    )
             except BaseException as exc:  # noqa: BLE001 - unmount must still happen
                 operation_error = exc
 
@@ -1897,6 +1937,16 @@ def process_iso_component(
             return True, (
                 f"SIKER (másolat, az eredeti seedel tovább): {image_names} -> {targets}"
             )
+
+        if side_by_side:
+            merge_staged_tree(stages, scan_root, output_owner)
+            shutil.rmtree(transaction, ignore_errors=True)
+            completed = True
+            image_names = ", ".join(str(image.path) for image in component.images)
+            if not stages:
+                return True, f"KIHAGYVA: már ki van bontva mellé: {image_names}"
+            log_event(f"EGYMÁS MELLÉ KÉSZ: {image_names} (az ISO seedel tovább)", action=True)
+            return True, f"SIKER (az ISO mellé, az eredeti seedel tovább): {image_names}"
 
         for bdmv_path in sorted(bdmv_to_replace):
             if not os.path.lexists(bdmv_path):
@@ -2235,6 +2285,7 @@ def run_rar_mode(
     work_root: Path,
     protected_domains: Sequence[str],
     output_root: Path | None = None,
+    side_by_side: bool = False,
 ) -> int:
     if not config.get("seven_zip"):
         raise CleanerError(
@@ -2252,6 +2303,8 @@ def run_rar_mode(
     components = build_components(matched_sets)
     copy_targets: dict[Path, Path] | None = None
     skipped: list[tuple[object, Path, str]] = []
+    if side_by_side:
+        print("Egymás mellé mód: a RAR-ok mappájába bont ki, az eredeti seedel tovább")
     if output_root is not None:
         print(f"Másolatos mód: kimenet {output_root}/<release>, az eredeti seedel tovább")
         todo, copy_targets, skipped = plan_copy_targets(
@@ -2276,7 +2329,7 @@ def run_rar_mode(
     if not args.yes:
         action = (
             "a kicsomagolt másolat elkészítéséhez"
-            if output_root is not None
+            if output_root is not None or side_by_side
             else "a RAR-kibontás és törlés indításához"
         )
         answer = input(f"\nÍrd be pontosan, hogy FELDOLGOZOM {action}: ")
@@ -2319,6 +2372,7 @@ def run_rar_mode(
                     min_free_bytes,
                     destinations,
                     output_root,
+                    side_by_side,
                 )
                 failures += 0 if success else 1
         print(message)
@@ -2334,6 +2388,7 @@ def run_iso_mode(
     work_root: Path,
     protected_domains: Sequence[str],
     output_root: Path | None = None,
+    side_by_side: bool = False,
 ) -> int:
     if os.geteuid() != 0:
         raise CleanerError("Az ISO mountolásához ezt rootként futtasd: sudo qbit-iso-cleaner")
@@ -2357,6 +2412,8 @@ def run_iso_mode(
     untouched: list[Path] = []
     # (component, root it is processed under, destinations or None)
     work: list[tuple[IsoComponent, Path, dict[Path, Path] | None]]
+    if side_by_side:
+        print("Egymás mellé mód: az ISO mappájába másol, az eredeti seedel tovább")
     if output_root is None:
         work = [
             (component, scan_root, None)
@@ -2422,7 +2479,7 @@ def run_iso_mode(
     if not args.yes:
         action = (
             "a mountolás és a kicsomagolt másolat elkészítéséhez"
-            if output_root is not None
+            if output_root is not None or side_by_side
             else "a mountolás, másolás és törlés indításához"
         )
         answer = input(f"\nÍrd be pontosan, hogy ISO_FELDOLGOZOM {action}: ")
@@ -2466,6 +2523,7 @@ def run_iso_mode(
                     output_owner,
                     destinations,
                     output_root,
+                    side_by_side,
                 )
                 failures += 0 if success else 1
         print(message)
@@ -2511,6 +2569,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_root = output_root.resolve(strict=True)
             if is_within(scan_root, output_root):
                 raise CleanerError("Az output_root nem lehet a scan root vagy annak szülője")
+        side_by_side = config.get("side_by_side", False)
+        if not isinstance(side_by_side, bool):
+            raise CleanerError("A side_by_side csak true vagy false lehet")
+        if side_by_side and output_root is not None:
+            raise CleanerError("A side_by_side és az output_root együtt nem használható")
 
         setup_logging(config, mode, args)
         if output_root is None:
@@ -2533,6 +2596,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             work_root,
             protected_domains,
             output_root,
+            side_by_side,
         )
         log_event(f"VÉGE kilépési kód={exit_code}", action=True)
         return exit_code

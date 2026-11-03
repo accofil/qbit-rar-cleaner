@@ -275,13 +275,15 @@ if len(values) != 12:
 ) = (
     value.decode("utf-8") for value in values
 )
-# A kézzel beállított output_root (másolatos mód) újratelepítéskor is megmarad.
+# A kézzel beállított output_root (másolatos mód) és side_by_side (egymás mellé
+# mód) újratelepítéskor is megmarad.
 extra = {}
 try:
     with open(sys.argv[2], encoding="utf-8") as previous:
-        old_output_root = json.load(previous).get("output_root")
-    if old_output_root:
-        extra["output_root"] = old_output_root
+        old_config = json.load(previous)
+    for key in ("output_root", "side_by_side"):
+        if old_config.get(key):
+            extra[key] = old_config[key]
 except (OSError, ValueError):
     pass
 with open(target, "w", encoding="utf-8") as handle:

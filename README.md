@@ -68,6 +68,23 @@ a lemezek közötti áthelyezés bájtra pontos. Az azonnali (ugyanazon a lemeze
 történő) átnevezés nem ír sort. Ha a kimenet nem terminál (cron, log),
 a folyamatjelző néma.
 
+## Egymás mellé mód (side_by_side)
+
+Ha a konfigurációban `"side_by_side": true` szerepel (és nincs `output_root`),
+a program a RAR/ISO tartalmát **a saját mappájába**, az archívum vagy az ISO
+mellé bontja ki, de az eredetihez nem nyúl:
+
+- a RAR-kötetek, az ISO és a torrentek érintetlenek maradnak és tovább
+  seedelnek (nincs leállítás, listából törlés, fájltörlés);
+- egy BD-ISO mellé így a BDMV-struktúra kerül, egy RAR-ok mellé a kibontott
+  fájl; a RAR-ból kibontott ISO-t a `qbit-iso-cleaner` szintén kibontja mellé;
+- ha az archívum/ISO minden fájlja már megvan mellette azonos méretben, a
+  release-t kihagyja (`már ki van bontva mellé`), így bármikor újrafuttatható;
+  a RAR-oknál ez a gyors listázással dől el, a teljes ellenőrzés előtt;
+- az eredetiket később kézzel törölheted, amikor már nem kell seedelni őket.
+
+Az `output_root` és a `side_by_side` együtt nem használható.
+
 ## A két mód közötti legfontosabb különbség
 
 A RAR- és az ISO-feldolgozást szándékosan nem lehet egyetlen menetben

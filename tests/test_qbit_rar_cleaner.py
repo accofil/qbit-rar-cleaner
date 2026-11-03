@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import tempfile
@@ -1369,6 +1370,88 @@ class CopyModeTests(unittest.TestCase):
             )
             self.assertNotIn("stop", events)
             self.assertNotIn("remove-list-only", events)
+
+
+class SideBySideTests(unittest.TestCase):
+    def make_torrent(self, root, name="Release"):
+        return cleaner.Torrent(
+            hash="e" * 40,
+            name=name,
+            state="stalledUP",
+            progress=1,
+            save_path=root,
+            content_path=root / name,
+        )
+
+    def test_rar_unpacked_next_to_volumes_which_keep_seeding(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            first = touch(root / "Release" / "release.rar", b"archive")
+            torrent = self.make_torrent(root)
+            archive_set = cleaner.ArchiveSet(first, (first,), frozenset({torrent.hash}))
+            component = cleaner.Component((archive_set,), frozenset({torrent.hash}))
+            client = FakeMutationClient(torrent)
+
+            def run():
+                return cleaner.process_component(
+                    component, {torrent.hash: torrent}, client, FakeExtractor(),
+                    root, root / "work", 0, side_by_side=True,
+                )
+
+            success, message = run()
+            self.assertTrue(success, message)
+            self.assertTrue(first.exists())
+            self.assertEqual((root / "Release" / "movie.mkv").read_bytes(), b"movie")
+            self.assertFalse(client.stopped or client.removed or client.started)
+
+            success, message = run()
+            self.assertTrue(success)
+            self.assertIn("már ki van bontva", message)
+
+    def test_iso_contents_next_to_iso_which_keeps_seeding(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            image = touch(root / "Release" / "disc.iso", b"iso")
+            torrent = self.make_torrent(root)
+            component = cleaner.IsoComponent(
+                (cleaner.IsoImage(image, frozenset({torrent.hash})),),
+                frozenset({torrent.hash}),
+            )
+            events = []
+            mounter = FakeIsoMounter({"disc.iso": {"BDMV/index.bdmv": b"index"}}, events)
+            client = FakeIsoMutationClient(torrent, events)
+
+            def run():
+                return cleaner.process_iso_component(
+                    component, {torrent.hash: torrent}, client, mounter,
+                    root, root / "work", 0, (os.getuid(), os.getgid()),
+                    side_by_side=True,
+                )
+
+            success, message = run()
+            self.assertTrue(success, message)
+            self.assertTrue(image.exists())
+            self.assertEqual((root / "Release" / "BDMV" / "index.bdmv").read_bytes(), b"index")
+            self.assertNotIn("stop", events)
+            self.assertNotIn("remove-list-only", events)
+
+            success, message = run()
+            self.assertTrue(success)
+            self.assertIn("már ki van bontva", message)
+
+    def test_side_by_side_and_output_root_exclude_each_other(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "scan").mkdir()
+            (root / "out").mkdir()
+            config = root / "config.json"
+            config.write_text(json.dumps({
+                "qb_url": "http://127.0.0.1:1", "qb_username": "u", "qb_password": "p",
+                "scan_root": str(root / "scan"), "work_root": str(root / "work"),
+                "log_dir": str(root / "logs"), "output_root": str(root / "out"),
+                "side_by_side": True,
+            }))
+            self.assertEqual(cleaner.main(["--config", str(config)]), 1)
 
 
 class MultiInstanceTests(unittest.TestCase):
