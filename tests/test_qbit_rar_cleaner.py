@@ -1493,6 +1493,20 @@ class ProgressTests(unittest.TestCase):
         self.assertIn("kész", written)
         self.assertTrue(written.endswith("\n"))
 
+    def test_line_fits_terminal_and_has_bar(self):
+        with mock.patch("sys.stdout") as stdout, mock.patch(
+            "shutil.get_terminal_size", return_value=os.terminal_size((60, 20))
+        ):
+            progress = cleaner.Progress("ISO másolása " + "x" * 80 + ".iso", total=100, enabled=True)
+            progress.started -= 10
+            progress._last_draw = 0.0
+            progress.advance(50)
+        line = stdout.write.call_args_list[-1].args[0].split("\x1b[2K")[-1]
+        self.assertLessEqual(len(line), 59)
+        self.assertIn("█", line)
+        self.assertIn("░", line)
+        self.assertIn("…", line)
+
     def test_quick_step_prints_nothing(self):
         with mock.patch("sys.stdout") as stdout:
             progress = cleaner.Progress("Gyors", total=10, enabled=True)

@@ -977,14 +977,25 @@ class Progress:
         if not self.enabled:
             return
         elapsed = now - self.started
-        parts = [f"  {self.label}: {self.percent:5.1f}%"]
+        tail = f" {self.percent:5.1f}%"
         if self.total:
-            parts.append(f"{gib(min(self.done, self.total))} / {gib(self.total)}")
-        if 0 < self.percent < 100 and elapsed >= 2:
+            done = gib(min(self.done, self.total)).removesuffix(" GiB")
+            tail += f"  {done}/{gib(self.total)}"
+        if suffix:
+            tail += f"  {suffix}"
+        elif 0 < self.percent < 100 and elapsed >= 2:
             remaining = elapsed * (100 - self.percent) / self.percent
-            parts.append(f"kb. {format_duration(remaining)} van hátra")
-        line = " | ".join(parts) + suffix
-        sys.stdout.write("\r" + line.ljust(self._width))
+            tail += f"  még {format_duration(remaining)}"
+        # The line must never be wider than the terminal: a wrapped line can no
+        # longer be redrawn in place and every update would print a new one.
+        columns = shutil.get_terminal_size((80, 24)).columns - 1
+        room = columns - len(tail) - 5
+        label = shorten_middle(self.label, max(12, min(room - 20, columns // 2)))
+        bar_width = max(10, min(40, room - len(label)))
+        filled = round(bar_width * self.percent / 100)
+        bar = "█" * filled + "░" * (bar_width - filled)
+        line = f"  {label} [{bar}]{tail}"[:columns]
+        sys.stdout.write("\r\x1b[2K" + line)
         sys.stdout.flush()
         self._width = len(line)
 
@@ -996,9 +1007,16 @@ class Progress:
         self.percent = 100.0
         self.done = max(self.done, self.total)
         now = time.monotonic()
-        self._draw(now, f" | kész ({format_duration(now - self.started)})")
+        self._draw(now, f"kész ({format_duration(now - self.started)})")
         sys.stdout.write("\n")
         sys.stdout.flush()
+
+
+def shorten_middle(text: str, width: int) -> str:
+    if len(text) <= width:
+        return text
+    keep = width - 1
+    return text[: keep - keep // 2] + "…" + text[len(text) - keep // 2 :]
 
 
 def format_duration(seconds: float) -> str:
