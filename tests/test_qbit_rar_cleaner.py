@@ -1454,6 +1454,31 @@ class SideBySideTests(unittest.TestCase):
             self.assertEqual(cleaner.main(["--config", str(config)]), 1)
 
 
+class SideBySideNoCheckTests(unittest.TestCase):
+    def test_side_by_side_skips_the_separate_7z_test(self):
+        class CountingExtractor(FakeExtractor):
+            tested = 0
+
+            def test(self, first_volume):
+                CountingExtractor.tested += 1
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            first = touch(root / "Release" / "release.rar", b"archive")
+            torrent = cleaner.Torrent(
+                hash="f" * 40, name="Release", state="stalledUP", progress=1,
+                save_path=root, content_path=root / "Release",
+            )
+            archive_set = cleaner.ArchiveSet(first, (first,), frozenset({torrent.hash}))
+            component = cleaner.Component((archive_set,), frozenset({torrent.hash}))
+            success, message = cleaner.process_component(
+                component, {torrent.hash: torrent}, FakeMutationClient(torrent),
+                CountingExtractor(), root, root / "work", 0, side_by_side=True,
+            )
+            self.assertTrue(success, message)
+            self.assertEqual(CountingExtractor.tested, 0)
+
+
 class MultiInstanceTests(unittest.TestCase):
     def test_item_lock_is_exclusive_per_key(self):
         with tempfile.TemporaryDirectory() as temporary:

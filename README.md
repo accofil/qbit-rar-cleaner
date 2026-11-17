@@ -83,6 +83,12 @@ mellé bontja ki, de az eredetihez nem nyúl:
   a RAR-oknál ez a gyors listázással dől el, a teljes ellenőrzés előtt;
 - az eredetiket később kézzel törölheted, amikor már nem kell seedelni őket.
 
+Ebben a módban nincs próbaüzem és megerősítő kérdés: a `qbit-rar-cleaner` és a
+`sudo qbit-iso-cleaner` kapcsoló nélkül rögtön kibont, mert az eredetihez nem
+nyúl. A RAR-oknál a külön 7z-teszt is elmarad: a kibontás maga ellenőrzi a
+CRC-t, hiba esetén semmi nem kerül a mappába. Csak a tervet a `--dry-run`
+kapcsoló mutatja.
+
 Az `output_root` és a `side_by_side` együtt nem használható.
 
 ## A két mód közötti legfontosabb különbség

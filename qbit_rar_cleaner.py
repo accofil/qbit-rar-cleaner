@@ -1699,7 +1699,10 @@ def process_component(
                 return True, f"KIHAGYVA: már ki van bontva mellé: {names}"
         for archive_set in component.archive_sets:
             with openable_first_volume(archive_set, links_root) as openable:
-                extractor.test(openable)
+                if not side_by_side:
+                    # Side by side touches no original: 7z x checks the CRCs while
+                    # unpacking and a failure leaves nothing behind, so no extra pass.
+                    extractor.test(openable)
                 entries = extractor.entries(openable)
             expected_bytes += sum(entry.size for entry in entries if not entry.is_directory)
             entries_by_set.append((archive_set, entries))
@@ -2242,6 +2245,11 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--yes", action="store_true", help="Megerősítő kérdés kihagyása --apply mellett"
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Egymás mellé módban: csak a terv, kibontás nélkül",
+    )
     parser.add_argument("--mode", choices=("rar", "iso"), help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
@@ -2592,6 +2600,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise CleanerError("A side_by_side csak true vagy false lehet")
         if side_by_side and output_root is not None:
             raise CleanerError("A side_by_side és az output_root együtt nem használható")
+        if side_by_side and not args.dry_run:
+            # Nothing original is changed in this mode: unpack straight away.
+            args.apply = args.yes = True
 
         setup_logging(config, mode, args)
         if output_root is None:
